@@ -206,6 +206,11 @@ cleanup_build_tmp() {
         rm -rf -- "$BUILD_TMP"
     fi
     BUILD_TMP=""
+    # Remove the shared parent only when it is empty, so unrelated files are
+    # never deleted. The completed candidate remains at /root/caddy.
+    if [[ -d "$BUILD_ROOT" ]]; then
+        rmdir -- "$BUILD_ROOT" 2>/dev/null || true
+    fi
 }
 
 cleanup_preflight_tmp() {
