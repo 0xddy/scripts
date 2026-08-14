@@ -2,13 +2,13 @@
 # Interactive Caddy APT + xcaddy plugin manager for Debian-family systems.
 # The official package remains managed by APT; the custom binary is selected
 # through dpkg-divert and update-alternatives using Caddy's documented layout.
-# Existing caddy.service/caddy-api.service mode is preserved. This script does
-# not change firewall rules or expose the Admin API.
+# Only the official caddy.service is managed, using /etc/caddy/Caddyfile.
+# No additional systemd service is created or enabled by this script.
 
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-SCRIPT_VERSION="1.0"
+SCRIPT_VERSION="1.1"
 MANIFEST="/etc/caddy/xcaddy-plugins.list"
 LAST_SUCCESS_MANIFEST="/etc/caddy/xcaddy-plugins.last-success.list"
 BUILD_ROOT="/root/build_tmp"
@@ -27,12 +27,10 @@ MANIFEST_EXISTS=0
 BUILD_TMP=""
 PREFLIGHT_TMP=""
 GO_COMMAND=""
-PREFERRED_SERVICE_MODE=""
-RECOVERY_MODE=""
+SERVICE_RECOVERY_NEEDED=0
 TXN_ACTIVE=0
 TXN_NEW=""
 TXN_PREVIOUS=""
-TXN_MODE=""
 TXN_ORIGINAL_SELECTION=""
 TXN_ORIGINAL_CUSTOM_EXISTED=0
 PRE_APT_BACKUP=""
@@ -72,66 +70,92 @@ unit_exists() {
     systemctl cat "$1" >/dev/null 2>&1
 }
 
-detect_service_mode() {
+caddy_service_state() {
+    local enabled_state
+
+    if ! unit_exists caddy.service; then
+        printf 'absent\n'
+        return
+    fi
+    if systemctl is-active --quiet caddy.service 2>/dev/null; then
+        printf 'active\n'
+        return
+    fi
+
+    enabled_state=$(systemctl is-enabled caddy.service 2>/dev/null || true)
+    case "$enabled_state" in
+        masked) printf 'masked\n' ;;
+        enabled) printf 'enabled-inactive\n' ;;
+        *) printf 'inactive\n' ;;
+    esac
+}
+
+service_state_label() {
+    case "$1" in
+        active) printf '运行中（caddy.service）' ;;
+        enabled-inactive) printf '已启用但未运行（caddy.service）' ;;
+        masked) printf '已被 masked（caddy.service）' ;;
+        inactive) printf '未运行（caddy.service）' ;;
+        *) printf '尚未安装' ;;
+    esac
+}
+
+legacy_api_enabled_or_active() {
+    local enabled_state
+
+    if systemctl is-active --quiet caddy-api.service 2>/dev/null; then
+        return 0
+    fi
+    enabled_state=$(systemctl is-enabled caddy-api.service 2>/dev/null || true)
+    [[ "$enabled_state" == "enabled" || "$enabled_state" == "enabled-runtime" ]]
+}
+
+preflight_caddy_service_transition() {
+    legacy_api_enabled_or_active || return 0
+    unit_exists caddy.service ||
+        die "检测到旧的 caddy-api.service，但系统中没有 caddy.service，无法安全切换"
+    [[ -x /usr/bin/caddy ]] || die "当前 /usr/bin/caddy 不可执行，无法安全切换服务"
+    [[ -f /etc/caddy/Caddyfile ]] ||
+        die "检测到旧的 caddy-api.service，但缺少 /etc/caddy/Caddyfile；请先准备 Caddyfile"
+
+    log "切换服务前先验证 /etc/caddy/Caddyfile"
+    validate_candidate_config /usr/bin/caddy
+}
+
+disable_legacy_api_service() {
     local api_active=0
-    local api_enabled=0
-    local native_active=0
-    local native_enabled=0
+    local api_enabled_state
 
     if systemctl is-active --quiet caddy-api.service 2>/dev/null; then
         api_active=1
     fi
-    if systemctl is-enabled --quiet caddy-api.service 2>/dev/null; then
-        api_enabled=1
+    api_enabled_state=$(systemctl is-enabled caddy-api.service 2>/dev/null || true)
+    if ((api_active == 1)) ||
+        [[ "$api_enabled_state" == "enabled" || "$api_enabled_state" == "enabled-runtime" ]]; then
+        warn "检测到旧的 caddy-api.service，将停用它并切换为唯一的 caddy.service"
     fi
-    if systemctl is-active --quiet caddy.service 2>/dev/null; then
-        native_active=1
-    fi
-    if systemctl is-enabled --quiet caddy.service 2>/dev/null; then
-        native_enabled=1
-    fi
-
-    if (((api_active || api_enabled) && (native_active || native_enabled))); then
-        printf 'conflict\n'
-    elif ((api_active)); then
-        printf 'api\n'
-    elif ((native_active)); then
-        printf 'caddyfile\n'
-    elif ((api_enabled)); then
-        printf 'api\n'
-    elif ((native_enabled)); then
-        printf 'caddyfile\n'
-    else
-        printf 'none\n'
-    fi
+    systemctl disable --now caddy-api.service >/dev/null 2>&1 || true
+    ! systemctl is-active --quiet caddy-api.service 2>/dev/null ||
+        die "无法停止旧的 caddy-api.service；为避免端口冲突，已中止操作"
+    api_enabled_state=$(systemctl is-enabled caddy-api.service 2>/dev/null || true)
+    [[ "$api_enabled_state" != "enabled" && "$api_enabled_state" != "enabled-runtime" ]] ||
+        die "无法禁用旧的 caddy-api.service；为确保只保留 caddy.service，已中止操作"
 }
 
-mode_label() {
-    case "$1" in
-        api) printf 'API 模式（caddy-api.service）' ;;
-        caddyfile) printf 'Caddyfile 模式（caddy.service）' ;;
-        conflict) printf '冲突：两个服务同时运行或启用' ;;
-        *) printf '未运行' ;;
-    esac
+prepare_caddy_service_only() {
+    local enabled_state
+
+    systemctl unmask caddy.service >/dev/null 2>&1 || return 1
+    systemctl daemon-reload || return 1
+    enabled_state=$(systemctl is-enabled caddy.service 2>/dev/null || true)
+    [[ "$enabled_state" != "masked" ]] || return 1
+    disable_legacy_api_service || return 1
 }
 
-mask_native_service() {
-    systemctl disable --now caddy.service >/dev/null 2>&1 || true
-    systemctl mask caddy.service >/dev/null
-    systemctl daemon-reload
-    local state
-    state=$(systemctl is-enabled caddy.service 2>/dev/null || true)
-    [[ "$state" == "masked" ]] || die "无法将 caddy.service 设为 masked"
-}
-
-unmask_native_service() {
-    systemctl unmask caddy.service >/dev/null 2>&1 || true
-    systemctl daemon-reload
-}
-
-stop_caddy_services() {
-    systemctl stop caddy-api.service >/dev/null 2>&1 || true
-    systemctl stop caddy.service >/dev/null 2>&1 || true
+stop_caddy_service() {
+    unit_exists caddy.service || return 0
+    systemctl stop caddy.service >/dev/null 2>&1 || return 1
+    ! systemctl is-active --quiet caddy.service 2>/dev/null
 }
 
 official_diversion_exists() {
@@ -159,30 +183,22 @@ repair_missing_caddy_entrypoint() {
     return 1
 }
 
-restart_service_mode() {
-    local mode=$1
+restart_caddy_service() {
+    prepare_caddy_service_only || return 1
+    unit_exists caddy.service || return 1
+    [[ -f /etc/caddy/Caddyfile ]] || return 1
+    systemctl enable caddy.service >/dev/null || return 1
+    systemctl restart caddy.service || return 1
+    systemctl is-active --quiet caddy.service
+}
 
-    case "$mode" in
-        api)
-            unit_exists caddy-api.service || return 1
-            mask_native_service
-            systemctl enable --now caddy-api.service
-            systemctl is-active --quiet caddy-api.service
-            ;;
-        caddyfile)
-            systemctl disable --now caddy-api.service >/dev/null 2>&1 || true
-            unmask_native_service
-            systemctl enable --now caddy.service
-            systemctl is-active --quiet caddy.service
-            ;;
-        none)
-            return 0
-            ;;
-        *)
-            error "检测到服务冲突，请先手动停止其中一个服务"
-            return 1
-            ;;
-    esac
+activate_current_binary_with_caddy_service() {
+    validate_candidate_config /usr/bin/caddy
+    SERVICE_RECOVERY_NEEDED=1
+    if ! restart_caddy_service; then
+        return 1
+    fi
+    SERVICE_RECOVERY_NEEDED=0
 }
 
 cleanup_build_tmp() {
@@ -242,8 +258,6 @@ migrate_direct_custom_layout() {
 }
 
 restore_pre_apt_binary() {
-    local mode=$RECOVERY_MODE
-
     ((PRE_APT_CAPTURED == 1)) || return 0
     [[ -x "$PRE_APT_BACKUP" ]] || {
         warn "临时回滚二进制不存在，无法恢复原插件版"
@@ -251,7 +265,12 @@ restore_pre_apt_binary() {
     }
 
     warn "正在恢复 APT 操作前的插件版 Caddy"
-    stop_caddy_services
+    if ((SERVICE_RECOVERY_NEEDED == 1)); then
+        if ! stop_caddy_service; then
+            warn "无法停止 caddy.service，拒绝在运行中恢复二进制"
+            return 1
+        fi
+    fi
     if official_diversion_exists; then
         if ! install -m 0755 "$PRE_APT_BACKUP" /usr/bin/caddy.custom; then
             warn "无法将临时回滚二进制恢复到 /usr/bin/caddy.custom"
@@ -276,21 +295,24 @@ restore_pre_apt_binary() {
         fi
     fi
 
-    if ! restart_service_mode "$mode"; then
-        warn "旧插件版已恢复，但原服务未能自动启动"
-        return 1
+    if ((SERVICE_RECOVERY_NEEDED == 1)); then
+        if ! restart_caddy_service; then
+            warn "旧插件版已恢复，但 caddy.service 未能自动启动"
+            return 1
+        fi
     fi
     discard_pre_apt_backup
-    RECOVERY_MODE=""
+    SERVICE_RECOVERY_NEEDED=0
 }
 
 rollback_binary_transaction() {
-    local mode=$TXN_MODE
-
     ((TXN_ACTIVE == 1)) || return 0
 
     warn "正在回滚 Caddy 二进制"
-    stop_caddy_services
+    if ! stop_caddy_service; then
+        warn "无法停止 caddy.service，拒绝继续回滚"
+        return 1
+    fi
     if [[ -n "$TXN_NEW" ]]; then
         if ! rm -f -- "$TXN_NEW"; then
             warn "无法清理未完成的新二进制：$TXN_NEW"
@@ -346,8 +368,8 @@ rollback_binary_transaction() {
         fi
     fi
 
-    if ! restart_service_mode "$mode"; then
-        warn "旧二进制已恢复，但原服务未能自动启动"
+    if ! restart_caddy_service; then
+        warn "旧二进制已恢复，但 caddy.service 未能自动启动"
         return 1
     fi
 
@@ -356,10 +378,9 @@ rollback_binary_transaction() {
     TXN_ACTIVE=0
     TXN_NEW=""
     TXN_PREVIOUS=""
-    TXN_MODE=""
     TXN_ORIGINAL_SELECTION=""
     TXN_ORIGINAL_CUSTOM_EXISTED=0
-    RECOVERY_MODE=""
+    SERVICE_RECOVERY_NEEDED=0
 }
 
 on_error() {
@@ -382,10 +403,10 @@ on_exit() {
         if ! restore_pre_apt_binary; then
             warn "自动恢复未完全成功；临时副本保留在：$PRE_APT_BACKUP"
         fi
-    elif [[ -n "$RECOVERY_MODE" ]]; then
-        warn "安装流程未完成，尝试恢复原服务"
+    elif ((SERVICE_RECOVERY_NEEDED == 1)); then
+        warn "安装流程未完成，尝试恢复 caddy.service"
         repair_missing_caddy_entrypoint || true
-        restart_service_mode "$RECOVERY_MODE" || true
+        restart_caddy_service || true
     fi
     cleanup_build_tmp
     cleanup_preflight_tmp
@@ -616,7 +637,7 @@ manifest_application_state() {
             fi
             ;;
         /usr/bin/caddy.default)
-            printf '当前使用 APT 官方版'
+            printf '当前使用 APT 原版（无 xcaddy 第三方插件）'
             ;;
         /usr/bin/caddy)
             if ! package_installed caddy; then
@@ -624,7 +645,7 @@ manifest_application_state() {
             elif binary_is_package_modified; then
                 printf '检测到直接覆盖的自定义版；下次构建会安全迁移'
             else
-                printf '当前使用 APT 官方版'
+                printf '当前使用 APT 原版（无 xcaddy 第三方插件）'
             fi
             ;;
         *)
@@ -634,24 +655,22 @@ manifest_application_state() {
 }
 
 print_status() {
-    local mode
-    local mode_color=$C_GREEN
+    local service_state
+    local service_color=$C_GREEN
     local manifest_state
-    local guard_state="未启用"
 
     load_manifest
-    mode=$(detect_service_mode)
-    [[ "$mode" == "conflict" ]] && mode_color=$C_RED
-    [[ "$mode" == "none" ]] && mode_color=$C_YELLOW
+    service_state=$(caddy_service_state)
+    [[ "$service_state" == "masked" ]] && service_color=$C_RED
+    if [[ "$service_state" == "absent" || "$service_state" == "inactive" ||
+        "$service_state" == "enabled-inactive" ]]; then
+        service_color=$C_YELLOW
+    fi
 
     if ((MANIFEST_EXISTS == 1)); then
         manifest_state="$MANIFEST"
     else
         manifest_state="尚未创建；首次安装将写入四个默认插件"
-    fi
-
-    if [[ "$(systemctl is-enabled caddy.service 2>/dev/null || true)" == "masked" ]]; then
-        guard_state="caddy.service 已 masked"
     fi
 
     printf '%s┌──────────────────────────────────────────────────────────────┐%s\n' "$C_CYAN" "$C_RESET"
@@ -662,8 +681,8 @@ print_status() {
     printf '  APT Caddy        %s\n' "$(apt_version)"
     printf '  当前 Caddy       %s\n' "$(current_caddy_version)"
     printf '  生效二进制       %s\n' "$(current_binary_path)"
-    printf '  服务模式         %s%s%s\n' "$mode_color" "$(mode_label "$mode")" "$C_RESET"
-    printf '  APT 服务保护     %s\n' "$guard_state"
+    printf '  Caddy 服务       %s%s%s\n' "$service_color" "$(service_state_label "$service_state")" "$C_RESET"
+    printf '  配置文件         /etc/caddy/Caddyfile\n'
     printf '  插件清单         %s\n' "$manifest_state"
     printf '  配置插件数量     %d\n' "${#PLUGINS[@]}"
     printf '  应用状态         %s\n' "$(manifest_application_state)"
@@ -680,7 +699,7 @@ print_menu() {
     printf '  %s[5]%s 查看插件          对比配置清单和当前编译模块\n' "$C_CYAN" "$C_RESET"
     printf '  %s[6]%s 恢复默认插件      重置为 Souin、SimpleFS、限流和 L4\n' "$C_CYAN" "$C_RESET"
     printf '\n%s二进制管理%s\n' "$C_BOLD" "$C_RESET"
-    printf '  %s[7]%s 切回官方版本      选择 APT 原版二进制，不删除插件清单\n' "$C_CYAN" "$C_RESET"
+    printf '  %s[7]%s 切回 APT 原版      使用无第三方插件的包原版，不删除插件清单\n' "$C_CYAN" "$C_RESET"
     printf '\n  %s[0]%s 退出\n' "$C_DIM" "$C_RESET"
 }
 
@@ -720,48 +739,37 @@ configure_official_repositories() {
     apt-get update
 }
 
-prepare_for_apt_transaction() {
-    PREFERRED_SERVICE_MODE=$(detect_service_mode)
-    if [[ "$PREFERRED_SERVICE_MODE" == "conflict" ]]; then
-        die "caddy.service 与 caddy-api.service 同时运行或启用，请先解决服务冲突"
-    fi
+reinstall_official_caddy() {
+    # --force-confmiss restores /etc/caddy/Caddyfile if an earlier API-only
+    # setup deleted it. Existing Caddyfile contents remain dpkg-managed.
+    apt-get install --reinstall -y -o Dpkg::Options::="--force-confmiss" caddy
+}
 
-    RECOVERY_MODE=$PREFERRED_SERVICE_MODE
+prepare_for_apt_transaction() {
+    preflight_caddy_service_transition
     capture_direct_custom_before_apt
-    if [[ "$PREFERRED_SERVICE_MODE" == "api" ]]; then
-        systemctl stop caddy-api.service >/dev/null 2>&1 || true
-        mask_native_service
-    elif [[ "$PREFERRED_SERVICE_MODE" == "caddyfile" ]]; then
-        systemctl stop caddy.service >/dev/null 2>&1 || true
-        unmask_native_service
-    fi
+    SERVICE_RECOVERY_NEEDED=1
+    prepare_caddy_service_only || die "无法切换为唯一的 caddy.service"
+    stop_caddy_service || die "无法停止 caddy.service，已取消 APT 替换"
     migrate_direct_custom_layout
 }
 
 install_apt_stack() {
-    prepare_for_apt_transaction
     install_apt_prerequisites
     configure_official_repositories
-
-    log "通过 APT 强制重新安装 Caddy，并安装或升级 xcaddy 和 Go"
-    apt-get install --reinstall -y caddy
     apt-get install -y xcaddy golang-go
+
+    prepare_for_apt_transaction
+    log "通过 APT 强制重新安装 Caddy"
+    reinstall_official_caddy
 
     if official_diversion_exists && [[ -x /usr/bin/caddy.default ]]; then
         update-alternatives --install /usr/bin/caddy caddy /usr/bin/caddy.default 10
     fi
 
-    if [[ "$PREFERRED_SERVICE_MODE" == "api" ]]; then
-        mask_native_service
-        restart_service_mode api || die "APT 完成后无法恢复 caddy-api.service"
-    elif [[ "$PREFERRED_SERVICE_MODE" == "caddyfile" ]]; then
-        restart_service_mode caddyfile || die "APT 完成后无法恢复 caddy.service"
-    elif [[ "$PREFERRED_SERVICE_MODE" == "none" ]]; then
-        PREFERRED_SERVICE_MODE=$(detect_service_mode)
-        [[ "$PREFERRED_SERVICE_MODE" == "conflict" ]] &&
-            die "APT 安装后检测到两个 Caddy 服务同时运行或启用"
-        RECOVERY_MODE=$PREFERRED_SERVICE_MODE
-    fi
+    [[ -f /etc/caddy/Caddyfile ]] || die "APT 安装后仍缺少 /etc/caddy/Caddyfile"
+    restart_caddy_service || die "APT 完成后无法启动 caddy.service"
+    SERVICE_RECOVERY_NEEDED=0
 }
 
 ensure_build_tools() {
@@ -977,56 +985,25 @@ service_user_and_home() {
 }
 
 validate_candidate_config() {
-    local mode=$1
-    local candidate_source=${2:-$BUILD_OUTPUT}
-    local unit
+    local candidate_source=${1:-$BUILD_OUTPUT}
+    local unit=caddy.service
     local service_user
     local service_home
     local working_directory
-    local config=""
-    local adapter=""
+    local config=/etc/caddy/Caddyfile
+    local adapter=caddyfile
     local candidate
-    local discovered=""
-    local exec_start=""
     local -a validate_args=()
 
-    case "$mode" in
-        caddyfile)
-            unit=caddy.service
-            config=/etc/caddy/Caddyfile
-            adapter=caddyfile
-            ;;
-        api)
-            unit=caddy-api.service
-            exec_start=$(systemctl show "$unit" --property=ExecStart --value 2>/dev/null || true)
-            [[ "$exec_start" == *"--resume"* ]] ||
-                die "$unit 未使用 --resume，重启可能丢失 API 配置，拒绝替换"
-            ;;
-        none)
-            warn "当前没有启用的 Caddy 服务，跳过运行配置预检"
-            return 0
-            ;;
-        *)
-            die "未知服务模式，无法预检：$mode"
-            ;;
-    esac
-
+    unit_exists "$unit" || die "未找到官方 $unit；本脚本不会创建其他 systemd 服务"
     IFS=$'\t' read -r service_user service_home < <(service_user_and_home "$unit")
     working_directory=$(systemctl show "$unit" --property=WorkingDirectory --value 2>/dev/null || true)
     if [[ -z "$working_directory" || ! -d "$working_directory" ]]; then
         working_directory=/
     fi
-    if [[ "$mode" == "api" ]]; then
-        config="$service_home/.config/caddy/autosave.json"
-        if [[ ! -f "$config" && -d "$service_home" ]]; then
-            discovered=$(find "$service_home" -type f -name autosave.json \
-                -path '*/caddy/autosave.json' -print -quit 2>/dev/null || true)
-            config=$discovered
-        fi
-    fi
 
-    [[ -n "$config" && -f "$config" ]] ||
-        die "未找到当前 $unit 的持久配置文件，拒绝重启以免空配置运行"
+    [[ -f "$config" ]] ||
+        die "未找到 $config；本脚本只支持 caddy.service + Caddyfile 模式"
 
     [[ -x "$candidate_source" ]] || die "候选二进制不可执行：$candidate_source"
     cleanup_preflight_tmp
@@ -1041,6 +1018,7 @@ validate_candidate_config() {
 
     log "使用候选二进制预检当前配置：$config"
     if [[ "$service_user" != "root" && -x "$(command -v runuser 2>/dev/null || true)" ]]; then
+        # shellcheck disable=SC2016 # Expanded by the child bash, not this shell.
         if ! runuser -u "$service_user" -- bash -c \
             'cd -- "$1" && shift && exec "$@"' bash "$working_directory" \
             env \
@@ -1095,13 +1073,10 @@ binary_is_package_modified() {
 }
 
 ensure_official_binary_layout() {
-    local mode=$1
-
     if official_diversion_exists; then
         if [[ ! -x /usr/bin/caddy.default ]]; then
-            [[ "$mode" == "api" ]] && mask_native_service
-            apt-get install --reinstall -y caddy
-            stop_caddy_services
+            reinstall_official_caddy
+            stop_caddy_service || die "无法停止 caddy.service，拒绝继续替换二进制"
         fi
         [[ -x /usr/bin/caddy.default ]] ||
             die "无法恢复 /usr/bin/caddy.default"
@@ -1111,9 +1086,8 @@ ensure_official_binary_layout() {
 
     if binary_is_package_modified; then
         log "检测到 /usr/bin/caddy 曾被直接覆盖，先恢复 APT 原版"
-        [[ "$mode" == "api" ]] && mask_native_service
-        apt-get install --reinstall -y caddy
-        stop_caddy_services
+        reinstall_official_caddy
+        stop_caddy_service || die "无法停止 caddy.service，拒绝继续替换二进制"
     fi
 
     dpkg-divert --divert /usr/bin/caddy.default --rename /usr/bin/caddy
@@ -1125,33 +1099,28 @@ ensure_official_binary_layout() {
 }
 
 apply_custom_binary() {
-    local requested_mode=${1:-}
-    local mode
     local original_binary
     local original_selection="default"
     local new_binary="/usr/bin/caddy.custom.new.$$"
 
     [[ -x "$BUILD_OUTPUT" ]] || die "请先构建 $BUILD_OUTPUT"
-    mode=${requested_mode:-$(detect_service_mode)}
-    [[ "$mode" != "conflict" ]] ||
-        die "两个 Caddy 服务同时运行或启用，拒绝替换二进制"
-    validate_candidate_config "$mode"
+    validate_candidate_config
 
     original_binary=$(current_binary_path)
-    RECOVERY_MODE=$mode
     capture_direct_custom_before_apt
+    SERVICE_RECOVERY_NEEDED=1
     if [[ "$original_binary" == "/usr/bin/caddy.custom" ]] || ((PRE_APT_CAPTURED == 1)); then
         original_selection="custom"
     fi
-    stop_caddy_services
+    prepare_caddy_service_only || die "无法切换为唯一的 caddy.service"
+    stop_caddy_service || die "无法停止 caddy.service，拒绝替换二进制"
     migrate_direct_custom_layout
-    ensure_official_binary_layout "$mode"
+    ensure_official_binary_layout
 
     rm -f -- "$new_binary"
     TXN_NEW=$new_binary
     install -m 0755 "$BUILD_OUTPUT" "$new_binary"
 
-    TXN_MODE=$mode
     TXN_PREVIOUS="/usr/bin/caddy.custom.rollback.$$"
     TXN_ORIGINAL_SELECTION=$original_selection
     TXN_ORIGINAL_CUSTOM_EXISTED=0
@@ -1175,8 +1144,8 @@ apply_custom_binary() {
         die "/usr/bin/caddy 没有切换到插件版"
     /usr/bin/caddy list-modules >/dev/null
 
-    if ! restart_service_mode "$mode"; then
-        journalctl -u caddy.service -u caddy-api.service -n 100 --no-pager >&2 || true
+    if ! restart_caddy_service; then
+        journalctl -u caddy.service -n 100 --no-pager >&2 || true
         if rollback_binary_transaction; then
             die "新插件版启动失败，已恢复原二进制"
         fi
@@ -1190,28 +1159,26 @@ apply_custom_binary() {
     rm -f -- "$TXN_PREVIOUS"
     TXN_ACTIVE=0
     TXN_PREVIOUS=""
-    TXN_MODE=""
     TXN_ORIGINAL_SELECTION=""
     TXN_ORIGINAL_CUSTOM_EXISTED=0
-    RECOVERY_MODE=""
+    SERVICE_RECOVERY_NEEDED=0
     log "插件版已生效：/usr/bin/caddy.custom"
 }
 
 build_and_apply() {
-    local mode=${1:-}
     build_custom_caddy
-    apply_custom_binary "$mode"
+    apply_custom_binary
 }
 
 one_click_install() {
-    if ! confirm "将通过 APT 强制重装/升级 Caddy，并按插件清单重新构建，确认继续？"; then
+    if ! confirm "将通过 APT 强制重装/升级 Caddy、构建插件版，并最终只启用 caddy.service，确认继续？"; then
         warn "已取消"
         return
     fi
 
     initialize_manifest
     install_apt_stack
-    build_and_apply "$PREFERRED_SERVICE_MODE"
+    build_and_apply
     log "一键安装/更新完成"
 }
 
@@ -1367,7 +1334,7 @@ rebuild_only() {
         warn "Caddy 尚未通过 APT 安装，请使用菜单 1"
         return
     }
-    if ! confirm "将按当前插件清单重新构建并替换，确认继续？"; then
+    if ! confirm "将按当前插件清单重新构建并替换，最终只启用 caddy.service，确认继续？"; then
         warn "已取消"
         return
     fi
@@ -1377,10 +1344,19 @@ rebuild_only() {
 }
 
 restore_official_binary() {
-    local mode
-
     if [[ "$(current_binary_path)" == "/usr/bin/caddy.default" ]]; then
-        log "当前已经是 APT 官方二进制"
+        if systemctl is-active --quiet caddy.service 2>/dev/null &&
+            ! legacy_api_enabled_or_active; then
+            log "当前已经是 APT 包原版二进制（无 xcaddy 第三方插件），且仅 caddy.service 正在运行"
+            return
+        fi
+        if ! confirm "当前已是 APT 包原版二进制（无 xcaddy 第三方插件）；是否切换为唯一的 caddy.service？"; then
+            warn "已取消"
+            return
+        fi
+        activate_current_binary_with_caddy_service ||
+            die "无法使用当前 APT 原版二进制启动 caddy.service"
+        log "已使用 APT 原版二进制（无 xcaddy 第三方插件）启动唯一的 caddy.service"
         return
     fi
 
@@ -1390,32 +1366,39 @@ restore_official_binary() {
             return
         fi
         if ! binary_is_package_modified; then
-            log "当前已经是 APT 官方二进制"
+            if systemctl is-active --quiet caddy.service 2>/dev/null &&
+                ! legacy_api_enabled_or_active; then
+                log "当前已经是 APT 包原版二进制（无 xcaddy 第三方插件），且仅 caddy.service 正在运行"
+                return
+            fi
+            if ! confirm "当前已是 APT 包原版二进制（无 xcaddy 第三方插件）；是否切换为唯一的 caddy.service？"; then
+                warn "已取消"
+                return
+            fi
+            activate_current_binary_with_caddy_service ||
+                die "无法使用当前 APT 原版二进制启动 caddy.service"
+            log "已使用 APT 原版二进制（无 xcaddy 第三方插件）启动唯一的 caddy.service"
             return
         fi
 
-        if ! confirm "将通过 APT 恢复官方二进制；若现有配置依赖插件会自动回滚，确认继续？"; then
+        if ! confirm "将通过 APT 恢复无第三方插件的包原版二进制；若配置依赖插件会自动回滚，确认继续？"; then
             warn "已取消"
             return
         fi
 
-        mode=$(detect_service_mode)
-        [[ "$mode" != "conflict" ]] || {
-            warn "两个服务同时运行或同时启用，请先解决冲突"
-            return
-        }
-
         prepare_for_apt_transaction
         log "通过 APT 恢复官方 Caddy 二进制"
-        apt-get install --reinstall -y caddy
+        reinstall_official_caddy
         [[ -x /usr/bin/caddy.default ]] || die "APT 未能恢复 /usr/bin/caddy.default"
         update-alternatives --install /usr/bin/caddy caddy /usr/bin/caddy.default 10
-        validate_candidate_config "$mode" /usr/bin/caddy.default
-        stop_caddy_services
+        validate_candidate_config /usr/bin/caddy.default
+        stop_caddy_service || die "无法停止 caddy.service，拒绝切换官方二进制"
         update-alternatives --set caddy /usr/bin/caddy.default
-        if ! restart_service_mode "$mode"; then
+        [[ "$(readlink -f /usr/bin/caddy 2>/dev/null || true)" == "/usr/bin/caddy.default" ]] ||
+            die "未能选择 APT 原版二进制 /usr/bin/caddy.default"
+        if ! restart_caddy_service; then
             if ! restore_pre_apt_binary; then
-                journalctl -u caddy.service -u caddy-api.service -n 100 --no-pager >&2 || true
+                journalctl -u caddy.service -n 100 --no-pager >&2 || true
                 die "官方版与原插件版均未能启动，请检查上方日志"
             fi
             warn "官方二进制无法加载现有配置，已恢复原插件版"
@@ -1423,41 +1406,38 @@ restore_official_binary() {
         fi
 
         discard_pre_apt_backup
-        RECOVERY_MODE=""
-        log "已恢复 APT 官方二进制：/usr/bin/caddy.default"
+        SERVICE_RECOVERY_NEEDED=0
+        log "已恢复 APT 原版二进制（无 xcaddy 第三方插件）：/usr/bin/caddy.default"
         return
     fi
 
-    if ! confirm "切回 APT 官方二进制可能导致依赖插件的配置无法启动，确认继续？"; then
+    if ! confirm "切回无第三方插件的 APT 原版可能导致依赖插件的配置无法启动，确认继续？"; then
         warn "已取消"
         return
     fi
 
-    mode=$(detect_service_mode)
-    [[ "$mode" != "conflict" ]] || {
-        warn "两个服务同时运行或同时启用，请先解决冲突"
-        return
-    }
-
-    validate_candidate_config "$mode" /usr/bin/caddy.default
-    RECOVERY_MODE=$mode
-    stop_caddy_services
+    validate_candidate_config /usr/bin/caddy.default
+    SERVICE_RECOVERY_NEEDED=1
+    prepare_caddy_service_only || die "无法切换为唯一的 caddy.service"
+    stop_caddy_service || die "无法停止 caddy.service，拒绝切换官方二进制"
     update-alternatives --set caddy /usr/bin/caddy.default
-    if ! restart_service_mode "$mode"; then
+    [[ "$(readlink -f /usr/bin/caddy 2>/dev/null || true)" == "/usr/bin/caddy.default" ]] ||
+        die "未能选择 APT 原版二进制 /usr/bin/caddy.default"
+    if ! restart_caddy_service; then
         warn "官方二进制无法加载现有配置，恢复插件版"
         if [[ -x /usr/bin/caddy.custom ]] &&
             update-alternatives --set caddy /usr/bin/caddy.custom &&
-            restart_service_mode "$mode"; then
-            RECOVERY_MODE=""
+            restart_caddy_service; then
+            SERVICE_RECOVERY_NEEDED=0
             warn "已恢复原插件版"
             return
         fi
-        journalctl -u caddy.service -u caddy-api.service -n 100 --no-pager >&2 || true
+        journalctl -u caddy.service -n 100 --no-pager >&2 || true
         die "官方版与原插件版均未能启动，请检查上方日志"
     fi
 
-    RECOVERY_MODE=""
-    log "已切换到 /usr/bin/caddy.default"
+    SERVICE_RECOVERY_NEEDED=0
+    log "已切换到 APT 原版二进制（无 xcaddy 第三方插件）：/usr/bin/caddy.default"
 }
 
 main_menu() {
