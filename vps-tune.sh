@@ -35,6 +35,8 @@ DOWNLOAD_MBPS=
 SMART_CAP_MIB=
 SMART_WANTED_MIB=
 SMART_BDP_MIB=
+SMART_AUTO_MIB=
+SMART_BUFFER_SOURCE=auto
 TMP=
 PACKAGE=
 JQ_BIN=
@@ -571,6 +573,8 @@ choose_plan() {
     MEM_MIB=$(awk '/MemTotal:/ {print int($2/1024)}' /proc/meminfo)
     if ((SMART)); then
         read -r BUFFER SMART_CAP_MIB SMART_WANTED_MIB SMART_BDP_MIB < <(smart_buffer_plan "$BANDWIDTH" "$RTT_MS" "$SMART_PROFILE" "$MEM_MIB")
+        SMART_AUTO_MIB=$BUFFER
+        SMART_BUFFER_SOURCE=auto
     elif [[ $BUFFER == auto ]]; then
         BUFFER=4
         ((MEM_MIB < 1024)) || BUFFER=8
@@ -823,8 +827,8 @@ buffer_plan_description() {
             *-bdp) basis='region-planning-not-measured' ;;
             asia|overseas) basis=not-used ;;
         esac
-        printf 'smart/%s; source=%s; upload/target=%s Mbit/s; download=%s Mbit/s; RTT=%s ms; RTT-basis=%s; BDP=%s MiB; wanted=%s MiB; RAM-cap=%s MiB; selected=%s MiB' \
-            "$SMART_PROFILE" "$BANDWIDTH_SOURCE" "$BANDWIDTH" "${DOWNLOAD_MBPS:-not-measured}" "${RTT_MS:-not-used}" "$basis" "$SMART_BDP_MIB" "$SMART_WANTED_MIB" "$SMART_CAP_MIB" "$BUFFER"
+        printf 'smart/%s; source=%s; upload/target=%s Mbit/s; download=%s Mbit/s; RTT=%s ms; RTT-basis=%s; BDP=%s MiB; wanted=%s MiB; RAM-cap=%s MiB; selected=%s MiB; selection=%s; automatic=%s MiB' \
+            "$SMART_PROFILE" "$BANDWIDTH_SOURCE" "$BANDWIDTH" "${DOWNLOAD_MBPS:-not-measured}" "${RTT_MS:-not-used}" "$basis" "$SMART_BDP_MIB" "$SMART_WANTED_MIB" "$SMART_CAP_MIB" "$BUFFER" "$SMART_BUFFER_SOURCE" "$SMART_AUTO_MIB"
     else
         printf 'standard; selected=%s MiB' "$BUFFER"
     fi
@@ -851,8 +855,64 @@ show_tuning_plan() {
         if [[ $SMART_PROFILE != asia && $SMART_PROFILE != overseas ]]; then
             printf '  参考 RTT  %s（%s）\n' "$(format_metric "$RTT_MS" ms)" "$basis"
         fi
-        printf '  内存保护  缓冲上限最多 %s MiB，已按本机内存限制\n' "$SMART_CAP_MIB"
+        printf '  计算参考  %s MiB\n' "$SMART_WANTED_MIB"
+        printf '  自动建议  %s MiB（自动内存保护上限 %s MiB）\n' "$SMART_AUTO_MIB" "$SMART_CAP_MIB"
+        if [[ $SMART_BUFFER_SOURCE == manual ]]; then
+            printf '  选择方式  手动指定 %s MiB，已覆盖自动建议\n' "$BUFFER"
+        else
+            printf '  选择方式  使用自动建议\n'
+        fi
     fi
+}
+
+show_buffer_notice() {
+    ((SMART)) || return 0
+    if [[ $SMART_BUFFER_SOURCE == manual ]]; then
+        if ((BUFFER > SMART_CAP_MIB)); then
+            warn "手动上限 $BUFFER MiB 高于自动内存保护值 $SMART_CAP_MIB MiB；高并发时可能增加内存压力。"
+        fi
+    elif ((SMART_WANTED_MIB > SMART_CAP_MIB)); then
+        warn "计算参考为 $SMART_WANTED_MIB MiB，自动模式按内存建议 $SMART_AUTO_MIB MiB。"
+    fi
+}
+
+set_smart_buffer() {
+    local value=$1
+    [[ $value =~ ^[1-9][0-9]{0,2}$ ]] && ((value >= 4 && value <= 256)) || return 1
+    BUFFER=$value
+    BUF_BYTES=$((BUFFER * 1024 * 1024))
+    SMART_BUFFER_SOURCE=manual
+}
+
+review_tuning_plan() {
+    while true; do
+        show_tuning_plan
+        show_buffer_notice
+        printf '\n1. 应用方案\n2. 仅预览，返回菜单\n'
+        if ((SMART)); then
+            printf '3. 手动设置缓冲上限\n4. 恢复自动建议（%s MiB）\n' "$SMART_AUTO_MIB"
+        fi
+        printf '0. 取消\n'
+        menu_read '请选择 [2]：' 2 || return 1
+        case $REPLY in
+            1) return 0 ;;
+            0|2) return 1 ;;
+            3)
+                ((SMART)) || { printf '无效选择。\n'; continue; }
+                while true; do
+                    menu_read '输入缓冲上限（4～256 MiB，整数；回车保留）：' || return 1
+                    [[ -n $REPLY ]] || break
+                    if set_smart_buffer "$REPLY"; then break; fi
+                    printf '请输入 4～256 的整数，例如 32。\n'
+                done ;;
+            4)
+                ((SMART)) || { printf '无效选择。\n'; continue; }
+                BUFFER=$SMART_AUTO_MIB
+                BUF_BYTES=$((BUFFER * 1024 * 1024))
+                SMART_BUFFER_SOURCE=auto ;;
+            *) printf '无效选择，请重新输入。\n' ;;
+        esac
+    done
 }
 
 show_completion() {
@@ -1155,7 +1215,8 @@ menu_intro() {
         3)
             print_heading '智能带宽调优'
             printf '保留当前内核，按带宽和参考 RTT 计算缓冲上限，并配置文件句柄及网络参数。\n'
-            printf '支持手动带宽、测速和 JSON 导入；测速会消耗公网流量。\n' ;;
+            printf '支持手动带宽、测速和 JSON 导入；测速会消耗公网流量。\n'
+            printf '计算后可保留自动建议，或手动指定缓冲上限。\n' ;;
     esac
     menu_read '输入 y 确认继续，回车返回 [y/N]：' n || return 1
     [[ $REPLY == y || $REPLY == Y ]]
@@ -1477,13 +1538,15 @@ main() {
     resolve_rtt
     resolve_bandwidth
     choose_plan
-    if ((REVIEW)); then show_tuning_plan
-    else
+    if ((REVIEW == 0)); then
         log "Plan: Debian $VERSION_ID ($CODENAME), kernel=${PACKAGE:-skip}, network=BBR+${QDISC^^}, nofile=$NOFILE, RAM=${MEM_MIB}MiB, buffer ceiling=${BUFFER}MiB"
         if ((SMART)); then log "$(buffer_plan_description)"; fi
+        show_buffer_notice
+    elif ((DRY)); then
+        show_tuning_plan
+        show_buffer_notice
     fi
     if ((SMART)); then
-        if ((SMART_WANTED_MIB > SMART_CAP_MIB)); then warn "按带宽计算需要 $SMART_WANTED_MIB MiB，已限制为 $SMART_CAP_MIB MiB 以控制内存占用；高延迟大流量连接可能受此限制。"; fi
         if [[ $SMART_PROFILE == asia || $SMART_PROFILE == overseas ]] && [[ -n $RTT_MS ]]; then warn '经验表模式不使用 RTT；如需按 RTT 计算，请选择 BDP 方案。'; fi
     fi
     if ((DRY)); then
@@ -1491,10 +1554,7 @@ main() {
         return
     fi
     if ((REVIEW)); then
-        printf '\n以上为本次方案。现有进程的文件限制需重启服务/重新登录后生效。\n'
-        printf '1. 应用方案\n2. 仅预览，返回菜单\n0. 取消\n'
-        menu_read '请选择 [2]：' 2 || { log '已取消，未写入调优配置。'; return; }
-        [[ $REPLY == 1 ]] || { log '预览结束，未写入调优配置。'; return; }
+        if ! review_tuning_plan; then log '预览结束，未写入调优配置。'; return; fi
     fi
     init_state
     if ! command -v sysctl >/dev/null || ! command -v modprobe >/dev/null || ! command -v tc >/dev/null; then
