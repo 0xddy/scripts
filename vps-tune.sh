@@ -38,11 +38,58 @@ PACKAGE=
 JQ_BIN=
 SPEEDTEST_ROOT=
 SPEEDTEST_CMD=()
+SPINNER_PID=
+SPEEDTEST_PING=
+SPEEDTEST_JITTER=
+SPEEDTEST_LOSS=
+SPEEDTEST_SERVER=
 
 log() { printf '[vps-tune] %s\n' "$*"; }
 warn() { printf '[WARNING] %s\n' "$*" >&2; }
 die() { printf '[ERROR] %s\n' "$*" >&2; exit 1; }
-cleanup() { [[ -z $TMP ]] || rm -rf -- "$TMP"; }
+stop_spinner() {
+    [[ -n $SPINNER_PID ]] || return 0
+    kill "$SPINNER_PID" 2>/dev/null || true
+    wait "$SPINNER_PID" 2>/dev/null || true
+    SPINNER_PID=
+    printf '\r\033[K' >&2
+}
+
+start_spinner() {
+    local message=$1
+    stop_spinner
+    # Keep redirected logs and basic terminals free of animation/ANSI escapes.
+    [[ -t 2 && ${TERM:-dumb} != dumb ]] || return 0
+    (
+        # A UI worker must never run the parent's temporary-directory cleanup.
+        trap - EXIT ERR INT TERM
+        # Reap the short foreground sleep before exiting on a stop request.
+        trap 'exit 0' TERM
+        local -a frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+        local index=0 started=$SECONDS
+        while true; do
+            printf '\r\033[K  %s %s · 已等待 %s 秒' "${frames[index]}" "$message" "$((SECONDS-started))" >&2
+            index=$(((index+1) % ${#frames[@]}))
+            sleep 0.15
+        done
+    ) &
+    SPINNER_PID=$!
+}
+
+print_heading() {
+    if [[ -t 1 && ${TERM:-dumb} != dumb && -z ${NO_COLOR+x} ]]; then
+        printf '\n\033[1;36m── %s ──\033[0m\n' "$1"
+    else
+        printf '\n── %s ──\n' "$1"
+    fi
+}
+
+format_metric() {
+    if [[ -z $1 ]]; then printf '未提供'
+    else awk -v value="$1" -v unit="$2" 'BEGIN {printf "%.2f %s", value, unit}'; fi
+}
+
+cleanup() { stop_spinner; [[ -z $TMP ]] || rm -rf -- "$TMP"; }
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
@@ -217,6 +264,38 @@ parse_speedtest_json() {
     BANDWIDTH=$(awk -v bytes="$upload_bytes" 'BEGIN {printf "%.6f", bytes*8/1000000}')
     DOWNLOAD_MBPS=$(awk -v bytes="$download_bytes" 'BEGIN {printf "%.6f", bytes*8/1000000}')
     valid_positive "$BANDWIDTH" 100000 || die 'Speedtest upload out of range'
+    # Optional display fields never participate in the tuning calculation.
+    # Remove control/bidi characters from remote text before terminal output.
+    # shellcheck disable=SC2016
+    result=$("${JQ_BIN:-jq}" -r '
+        def metric($limit):
+            if type == "number" and . >= 0 and . <= $limit then tostring else "-" end;
+        (.ping | if type == "object" then . else {} end) as $ping |
+        (.server | if type == "object" then . else {} end) as $server |
+        [($ping.latency | metric(60000)), ($ping.jitter | metric(60000)),
+         (.packetLoss | metric(100)),
+         ([$server.name, $server.location, $server.country] |
+          map(select(type == "string" and length > 0)) | join(" · ") |
+          gsub("[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]"; " ") |
+          .[0:120] | if length == 0 then "未提供" else . end)] | @tsv' "$input") || result=$'-\t-\t-\t未提供'
+    IFS=$'\t' read -r SPEEDTEST_PING SPEEDTEST_JITTER SPEEDTEST_LOSS SPEEDTEST_SERVER <<< "$result"
+    [[ $SPEEDTEST_PING != - ]] || SPEEDTEST_PING=
+    [[ $SPEEDTEST_JITTER != - ]] || SPEEDTEST_JITTER=
+    [[ $SPEEDTEST_LOSS != - ]] || SPEEDTEST_LOSS=
+    return 0
+}
+
+show_speedtest_result() {
+    local title='测速结果'
+    [[ $BANDWIDTH_SOURCE != ookla-json ]] || title='测速结果（导入 JSON）'
+    print_heading "$title"
+    printf '  下载速度  %s\n' "$(format_metric "$DOWNLOAD_MBPS" Mbps)"
+    printf '  上传速度  %s\n' "$(format_metric "$BANDWIDTH" Mbps)"
+    printf '  测速延迟  %s\n' "$(format_metric "$SPEEDTEST_PING" ms)"
+    printf '  延迟抖动  %s\n' "$(format_metric "$SPEEDTEST_JITTER" ms)"
+    printf '  丢包比例  %s\n' "$(format_metric "$SPEEDTEST_LOSS" '%')"
+    printf '  测速节点  %s\n' "${SPEEDTEST_SERVER:-未提供}"
+    printf '\n  延迟对应上方测速节点；智能调优使用另行选择的参考 RTT。\n'
 }
 
 ensure_tmp() {
@@ -263,12 +342,15 @@ resolve_rtt() {
     local -A seen=() covered_region=() covered_isp=()
     mkdir -p "$directory"
     log '探测北京、上海、广东的电信/联通/移动公开测点：每点 3 次 TCP 连接，约 10 秒。'
+    start_spinner '正在探测大陆三网 RTT'
     while read -r region isp label; do
         host="$region-${isp,,}-v4.ip.zstaticcdn.com"
         probe_cn_site "$host" "$directory/$region-$isp" &
         jobs+=("$!")
     done < <(cn_rtt_targets)
     for pid in "${jobs[@]}"; do wait "$pid" || true; done
+    stop_spinner
+    print_heading '大陆三网 RTT'
     : > "$directory/medians"
     while read -r region isp label; do
         key=$region-$isp
@@ -407,7 +489,9 @@ resolve_bandwidth() {
         prepare_isolated_speedtest
         log '开始 Ookla 测速（最多 180 秒）；测速服务器的 ping 不作为大陆 RTT。'
         local speedtest_status=0
+        start_spinner '正在测速，请稍候'
         { timeout --kill-after=5 180 "${SPEEDTEST_CMD[@]}" --accept-license --accept-gdpr --ca-certificate=/etc/ssl/certs/ca-certificates.crt --progress=no --format=json > "$TMP/speedtest.json"; } 2> "$TMP/speedtest-error.log" || speedtest_status=$?
+        stop_spinner
         if ((speedtest_status != 0)); then
             warn "Ookla 退出码=$speedtest_status；系统=$(uname -srmo)；MemAvailable=$(awk '/MemAvailable:/ {print $2 " kB"}' /proc/meminfo)"
             if [[ -s $TMP/speedtest-error.log ]]; then warn "$(tail -n 10 "$TMP/speedtest-error.log")"
@@ -424,6 +508,7 @@ resolve_bandwidth() {
         parse_speedtest_json "$SPEEDTEST_JSON"
         BANDWIDTH_SOURCE=ookla-json
     fi
+    if ((DRY == 0)); then show_speedtest_result; fi
 }
 
 is_container() {
@@ -713,6 +798,43 @@ buffer_plan_description() {
     else
         printf 'standard; selected=%s MiB' "$BUFFER"
     fi
+}
+
+show_tuning_plan() {
+    print_heading '本次优化方案'
+    printf '  系统版本  Debian %s · 内存 %s MiB\n' "$VERSION_ID" "$MEM_MIB"
+    printf '  内核方案  %s\n' "${PACKAGE:-保留当前内核}"
+    printf '  网络配置  BBR + CAKE\n'
+    printf '  文件句柄  默认每进程上限 %s\n' "$NOFILE"
+    printf '  缓冲上限  每个 TCP 连接的收/发缓冲各 %s MiB（按需使用）\n' "$BUFFER"
+    if ((SMART)); then
+        local basis='手动填写' profile='带宽与 RTT 计算'
+        case $SMART_PROFILE in
+            asia-bdp) basis='亚太区域规划值' ;;
+            overseas-bdp) basis='欧美区域规划值' ;;
+            asia) profile='亚太带宽经验表' ;;
+            overseas) profile='欧美带宽经验表' ;;
+        esac
+        [[ $RTT_SOURCE != cn-tcp-* ]] || basis='大陆三网实测 P75'
+        printf '  调优方式  %s\n' "$profile"
+        printf '  参考带宽  %s（出口/上传）\n' "$(format_metric "$BANDWIDTH" Mbps)"
+        if [[ $SMART_PROFILE != asia && $SMART_PROFILE != overseas ]]; then
+            printf '  参考 RTT  %s（%s）\n' "$(format_metric "$RTT_MS" ms)" "$basis"
+        fi
+        printf '  内存保护  缓冲上限最多 %s MiB，已按本机内存限制\n' "$SMART_CAP_MIB"
+    fi
+}
+
+show_completion() {
+    print_heading '优化配置已保存'
+    printf '  文件句柄：系统默认上限已更新为 %s。\n' "$NOFILE"
+    printf '            现有会话和服务保留原限制，重新登录或重启服务后检查。\n'
+    if [[ $KERNEL != skip ]]; then
+        printf '  XanMod：内核已安装/更新，重启后请确认已切换到目标版本。\n'
+    fi
+    printf '  BBR + CAKE：已写入开机配置，实际网卡队列需重启后检查。\n'
+    printf '\n  下一步：方便时选择菜单 8 重启，重新连接后选择菜单 5 检查生效状态。\n'
+    printf '  原配置已备份，可通过菜单 6 回滚。\n'
 }
 
 save_runtime() {
@@ -1031,8 +1153,7 @@ main() {
     if [[ $ACTION == measure ]]; then
         if ((TEST)) || is_container; then die '容器内禁止公网测速；使用手动数据或 JSON 测试。'; fi
         resolve_bandwidth
-        printf '\n测速结果：上传 %s Mbit/s，下载 %s Mbit/s。\n' "$BANDWIDTH" "$DOWNLOAD_MBPS"
-        printf '未修改系统调优配置；临时工具、配置和缓存将在退出时清理。\n'
+        printf '\n  本次仅测速；临时工具、配置和缓存将在测速结束后自动清理。\n'
         return
     fi
     if [[ $ACTION == rollback ]]; then
@@ -1052,11 +1173,14 @@ main() {
     resolve_rtt
     resolve_bandwidth
     choose_plan
-    log "Plan: Debian $VERSION_ID ($CODENAME), kernel=${PACKAGE:-skip}, network=BBR+CAKE, nofile=$NOFILE, RAM=${MEM_MIB}MiB, buffer ceiling=${BUFFER}MiB"
+    if ((REVIEW)); then show_tuning_plan
+    else
+        log "Plan: Debian $VERSION_ID ($CODENAME), kernel=${PACKAGE:-skip}, network=BBR+CAKE, nofile=$NOFILE, RAM=${MEM_MIB}MiB, buffer ceiling=${BUFFER}MiB"
+        if ((SMART)); then log "$(buffer_plan_description)"; fi
+    fi
     if ((SMART)); then
-        log "$(buffer_plan_description)"
-        if ((SMART_WANTED_MIB > SMART_CAP_MIB)); then warn 'Requested buffer exceeds memory cap; capped. This may limit a high-BDP flow'; fi
-        if [[ $SMART_PROFILE == asia || $SMART_PROFILE == overseas ]] && [[ -n $RTT_MS ]]; then warn 'Region-table mode does not use RTT in its calculation; choose bdp to use RTT'; fi
+        if ((SMART_WANTED_MIB > SMART_CAP_MIB)); then warn "按带宽计算需要 $SMART_WANTED_MIB MiB，已限制为 $SMART_CAP_MIB MiB 以控制内存占用；高延迟大流量连接可能受此限制。"; fi
+        if [[ $SMART_PROFILE == asia || $SMART_PROFILE == overseas ]] && [[ -n $RTT_MS ]]; then warn '经验表模式不使用 RTT；如需按 RTT 计算，请选择 BDP 方案。'; fi
     fi
     if ((DRY)); then
         log 'DRY RUN: no changes. Apply also checks container/GRUB/Secure Boot/DKMS/free space and signed APT dependencies.'
@@ -1077,12 +1201,10 @@ main() {
     configure_limits
     configure_network
     apply_runtime
-    log 'Configuration installed. First-run originals retained for rollback.'
     if ((TEST)); then
         warn 'CONTAINER TEST finished. This does not prove kernel boot, host sysctls or throughput gains'
     else
-        warn 'Reboot required for XanMod and all newly started processes/sessions. Existing sessions/services retain their limits'
-        warn 'BBR + CAKE configured persistently. CAKE applies to new qdiscs after reboot; run menu check to verify the actual interface queues'
+        show_completion
         if ((REBOOT)); then systemctl reboot; fi
     fi
 }
