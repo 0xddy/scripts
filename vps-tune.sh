@@ -1089,6 +1089,84 @@ menu_smart() {
     menu_run "${MENU_ARGS[@]}"
 }
 
+runtime_value() {
+    local value
+    if value=$(sysctl -n "$1" 2>/dev/null) && [[ -n $value ]]; then
+        printf '%s' "$value"
+    else
+        printf '未获取'
+    fi
+}
+
+menu_qdisc_status() {
+    local interface output types separator=
+    local -a interfaces=()
+    if ! command -v ip >/dev/null || ! command -v tc >/dev/null; then
+        printf '未获取'; return 0
+    fi
+    mapfile -t interfaces < <({ ip -o -4 route show default 2>/dev/null || true; ip -o -6 route show default 2>/dev/null || true; } |
+        awk '{for(i=1;i<NF;i++) if($i=="dev") print $(i+1)}' | sort -u)
+    if ((${#interfaces[@]} == 0)); then printf '无默认路由'; return 0; fi
+    for interface in "${interfaces[@]}"; do
+        types=未获取
+        if output=$(tc qdisc show dev "$interface" 2>/dev/null); then
+            # Show real root/leaf disciplines, including mixed mq leaves.
+            # ingress/clsact hooks are unrelated to the egress queue choice.
+            types=$(awk '
+                $1=="qdisc" && $2!="ingress" && $2!="clsact" && !seen[$2]++ {
+                    printf "%s%s", sep, $2; sep="+"
+                }
+                END {if(sep=="") printf "未获取"}' <<< "$output")
+        fi
+        printf '%s%s: %s' "$separator" "$interface" "$types"
+        separator=' · '
+    done
+}
+
+menu_service_limits() {
+    local properties key value soft='' hard=''
+    # Read the running manager, not the saved drop-in or next apply's options.
+    # A missing/unresponsive manager must not prevent opening the menu.
+    if properties=$(timeout --kill-after=1 2 systemctl show -p DefaultLimitNOFILE -p DefaultLimitNOFILESoft 2>/dev/null); then
+        while IFS='=' read -r key value; do
+            case $key in
+                DefaultLimitNOFILESoft) soft=$value ;;
+                DefaultLimitNOFILE) hard=$value ;;
+            esac
+        done <<< "$properties"
+    fi
+    if [[ $soft =~ ^([0-9]+|infinity)$ && $hard =~ ^([0-9]+|infinity)$ ]]; then
+        printf '软 %s / 硬 %s' "$soft" "$hard"
+    else
+        printf '未获取'
+    fi
+}
+
+menu_tcp_ceiling() {
+    local value
+    value=$(runtime_value "$1")
+    awk '
+        NF==3 && $3 ~ /^[0-9]+$/ {
+            mib=$3/1048576; valid=1;
+            if(mib==int(mib)) printf "%d MiB", mib;
+            else printf "%.2f MiB", mib;
+        }
+        END {if(!valid) printf "未获取"}' <<< "$value"
+}
+
+show_menu_status() {
+    # Re-read on every menu display; selections and saved files are not proof
+    # that the running kernel, manager or current process uses those values.
+    printf '当前内核：%s\n' "$(uname -r)"
+    printf '拥塞控制：%s · 默认队列：%s\n' \
+        "$(runtime_value net.ipv4.tcp_congestion_control)" "$(runtime_value net.core.default_qdisc)"
+    printf '网卡队列：%s\n' "$(menu_qdisc_status)"
+    printf '进程句柄：软 %s / 硬 %s\n' "$(ulimit -Sn)" "$(ulimit -Hn)"
+    printf '服务默认句柄：%s\n' "$(menu_service_limits)"
+    printf 'TCP 缓冲上限：收 %s / 发 %s\n\n' \
+        "$(menu_tcp_ceiling net.ipv4.tcp_rmem)" "$(menu_tcp_ceiling net.ipv4.tcp_wmem)"
+}
+
 interactive_menu() {
     local SCRIPT_SELF MENU_NOFILE=$NOFILE MENU_KERNEL=$KERNEL
     local MENU_CPU=$CPU MENU_BUFFER=$BUFFER MENU_DKMS=$ALLOW_DKMS
@@ -1097,7 +1175,7 @@ interactive_menu() {
     [[ -f $SCRIPT_SELF ]] || die '请先将脚本保存为本地文件，再打开菜单。'
     while true; do
         printf '\n====== Debian %s / VPS 系统优化 ======\n' "$VERSION_ID"
-        printf '当前内核：%s\n全局文件句柄默认值：%s\n' "$(uname -r)" "$MENU_NOFILE"
+        show_menu_status
         ((TEST == 0)) || printf '【Docker 测试模式】不改宿主参数、不重启、不发起公网测速。\n'
         printf '1. 完整配置\n2. 常规调优\n3. 智能带宽调优\n'
         printf '4. 临时测速\n5. 检查生效状态\n6. 回滚配置\n'
