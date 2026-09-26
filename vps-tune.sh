@@ -11,6 +11,8 @@ SYSCTL=/etc/sysctl.d/99-zz-vps-tune.conf
 KEYRING=/etc/apt/keyrings/vps-tune-xanmod.gpg
 ACTION=apply
 KERNEL=lts
+QDISC=cake
+QDISC_EXPLICIT=0
 CPU=auto
 NOFILE=1048576
 BUFFER=auto
@@ -44,9 +46,26 @@ SPEEDTEST_JITTER=
 SPEEDTEST_LOSS=
 SPEEDTEST_SERVER=
 
-log() { printf '[vps-tune] %s\n' "$*"; }
-warn() { printf '[WARNING] %s\n' "$*" >&2; }
-die() { printf '[ERROR] %s\n' "$*" >&2; exit 1; }
+ui_text() {
+    local tone=$1 value=$2 code=
+    case $tone in
+        heading) code='1;36' ;;
+        accent) code=36 ;;
+        good) code=32 ;;
+        warning) code=33 ;;
+        error) code=31 ;;
+        muted) code=90 ;;
+    esac
+    if [[ -n $code && -t 1 && ${TERM:-dumb} != dumb && -z ${NO_COLOR+x} ]]; then
+        printf '\033[%sm%s\033[0m' "$code" "$value"
+    else
+        printf '%s' "$value"
+    fi
+}
+
+log() { ui_text accent '[vps-tune]'; printf ' %s\n' "$*"; }
+warn() { ui_text warning "[WARNING] $*" >&2; printf '\n' >&2; }
+die() { ui_text error "[ERROR] $*" >&2; printf '\n' >&2; exit 1; }
 stop_spinner() {
     [[ -n $SPINNER_PID ]] || return 0
     kill "$SPINNER_PID" 2>/dev/null || true
@@ -77,11 +96,7 @@ start_spinner() {
 }
 
 print_heading() {
-    if [[ -t 1 && ${TERM:-dumb} != dumb && -z ${NO_COLOR+x} ]]; then
-        printf '\n\033[1;36m── %s ──\033[0m\n' "$1"
-    else
-        printf '\n── %s ──\n' "$1"
-    fi
+    printf '\n'; ui_text heading "── $1 ──"; printf '\n'
 }
 
 format_metric() {
@@ -93,15 +108,16 @@ cleanup() { stop_spinner; [[ -z $TMP ]] || rm -rf -- "$TMP"; }
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
-on_error() { local rc=$1 line=$2; printf '[ERROR] line %s, exit %s. Inspect output; backup: %s\n' "$line" "$rc" "$STATE" >&2; exit "$rc"; }
+on_error() { local rc=$1 line=$2; ui_text error "[ERROR] line $line, exit $rc. Inspect output; backup: $STATE" >&2; printf '\n' >&2; exit "$rc"; }
 trap 'on_error "$?" "$LINENO"' ERR
 
 usage() {
     cat <<'EOF'
 Usage: bash vps-tune.sh                    # Chinese interactive menu
-       bash vps-tune.sh [menu|apply|check|rollback|measure] [options]
+       bash vps-tune.sh [menu|apply|check|rollback|measure|queue] [options]
   --review                Show the calculated plan, then ask apply/preview/cancel.
   --kernel lts|main|skip    Default: lts. Debian 12 supports LTS only.
+  --qdisc cake|fq|fq_codel Required for queue: change only the egress discipline.
   --cpu-level auto|v1|v2|v3  Auto chooses the level supported by EVERY CPU.
   --nofile NUMBER          Global soft/hard limit; 65536..1048576.
   --buffer-mib auto|4|8|16|32|64  Per-socket maximum, not initial allocation.
@@ -136,8 +152,8 @@ EOF
 parse_args() {
     while (($#)); do
         case $1 in
-            menu|apply|check|rollback|measure) ACTION=$1; shift ;;
-            --kernel|--cpu-level|--nofile|--buffer-mib|--smart-profile|--bandwidth-mbps|--rtt-ms|--speedtest-json)
+            menu|apply|check|rollback|measure|queue) ACTION=$1; shift ;;
+            --kernel|--cpu-level|--nofile|--buffer-mib|--smart-profile|--bandwidth-mbps|--rtt-ms|--speedtest-json|--qdisc)
                 (($# >= 2)) || die "Missing value for $1"
                 case $1 in
                     --kernel) KERNEL=$2 ;; --cpu-level) CPU=$2 ;;
@@ -146,6 +162,7 @@ parse_args() {
                     --bandwidth-mbps) BANDWIDTH=$2 ;;
                     --rtt-ms) RTT_MS=$2 ;;
                     --speedtest-json) SPEEDTEST_JSON=$2 ;;
+                    --qdisc) QDISC=$2; QDISC_EXPLICIT=1 ;;
                 esac
                 shift 2 ;;
             --reboot) REBOOT=1; shift ;;
@@ -165,6 +182,11 @@ parse_args() {
     [[ $CPU =~ ^(auto|v1|v2|v3)$ ]] || die 'Invalid --cpu-level'
     if [[ ! $NOFILE =~ ^[1-9][0-9]{4,6}$ ]] || ((NOFILE < 65536 || NOFILE > 1048576)); then die 'Invalid --nofile'; fi
     [[ $BUFFER =~ ^(auto|4|8|16|32|64)$ ]] || die 'Invalid --buffer-mib'
+    [[ $QDISC =~ ^(cake|fq|fq_codel)$ ]] || die 'Invalid --qdisc'
+    if [[ $ACTION == queue ]]; then
+        ((QDISC_EXPLICIT)) || die 'queue requires --qdisc cake|fq|fq_codel'
+        KERNEL=skip
+    elif ((QDISC_EXPLICIT)); then die '--qdisc is only for the queue action'; fi
     if ((TEST && REBOOT)); then die 'Container tests cannot reboot'; fi
     if [[ $ACTION != apply ]] && ((REBOOT)); then die 'Reboot flag requires apply'; fi
     if ((REVIEW)) && [[ $ACTION != apply ]]; then die '--review requires apply'; fi
@@ -757,6 +779,14 @@ LimitNOFILE=$NOFILE:$NOFILE
 EOF
 }
 
+configured_qdisc() {
+    local selected
+    selected=$(awk -F= '/^[[:space:]]*-?net\.core\.default_qdisc[[:space:]]*=/ {
+        value=$2; sub(/#.*/, "", value); gsub(/[[:space:]]/, "", value)
+    } END {print value}' "$SYSCTL" 2>/dev/null) || selected=
+    case $selected in cake|fq|fq_codel) printf '%s' "$selected" ;; *) printf cake ;; esac
+}
+
 configure_network() {
     write_file "$SYSCTL" <<EOF
 # Managed by vps-tune. Values are ceilings, not preallocated buffers.
@@ -777,12 +807,12 @@ net.ipv4.tcp_syncookies = 1
 net.ipv4.tcp_mtu_probing = 1
 # Optional until the new kernel boots. The sysctl algorithm name is bbr,
 # including on XanMod releases carrying BBRv3; it is not named bbr3.
--net.core.default_qdisc = cake
+-net.core.default_qdisc = $QDISC
 -net.ipv4.tcp_congestion_control = bbr
 EOF
-    write_file /etc/modules-load.d/90-vps-tune.conf <<'EOF'
+    write_file /etc/modules-load.d/90-vps-tune.conf <<EOF
 tcp_bbr
-sch_cake
+sch_$QDISC
 EOF
 }
 
@@ -804,7 +834,7 @@ show_tuning_plan() {
     print_heading '本次优化方案'
     printf '  系统版本  Debian %s · 内存 %s MiB\n' "$VERSION_ID" "$MEM_MIB"
     printf '  内核方案  %s\n' "${PACKAGE:-保留当前内核}"
-    printf '  网络配置  BBR + CAKE\n'
+    printf '  网络配置  BBR + %s\n' "${QDISC^^}"
     printf '  文件句柄  默认每进程上限 %s\n' "$NOFILE"
     printf '  缓冲上限  每个 TCP 连接的收/发缓冲各 %s MiB（按需使用）\n' "$BUFFER"
     if ((SMART)); then
@@ -832,8 +862,8 @@ show_completion() {
     if [[ $KERNEL != skip ]]; then
         printf '  XanMod：内核已安装/更新，重启后请确认已切换到目标版本。\n'
     fi
-    printf '  BBR + CAKE：已写入开机配置，实际网卡队列需重启后检查。\n'
-    printf '\n  下一步：方便时选择菜单 8 重启，重新连接后选择菜单 5 检查生效状态。\n'
+    printf '  BBR + %s：已写入开机配置，实际网卡队列需重启后检查。\n' "${QDISC^^}"
+    printf '\n  下一步：方便时手动重启，重新连接后选择菜单 5 检查生效状态。\n'
     printf '  原配置已备份，可通过菜单 6 回滚。\n'
 }
 
@@ -858,7 +888,7 @@ apply_runtime() {
         save_runtime "$key"
     done < "$SYSCTL"
     modprobe tcp_bbr || warn 'tcp_bbr unavailable in the running kernel; retry after XanMod reboot'
-    modprobe sch_cake || warn 'sch_cake unavailable in the running kernel; retry after XanMod reboot'
+    modprobe "sch_$QDISC" || warn "sch_$QDISC unavailable in the running kernel; retry after XanMod reboot"
     while IFS= read -r line; do
         [[ $line == *=* && $line != \#* ]] || continue
         key=${line%%=*}; key=${key// /}; value=${line#*=}; optional=0
@@ -872,28 +902,127 @@ apply_runtime() {
     systemctl daemon-reexec
 }
 
-check_cake_qdiscs() {
-    local interface output bad=0
+persist_queue_choice() {
+    local content modules=/etc/modules-load.d/$TAG
+    if [[ -f $SYSCTL ]]; then content=$(cat "$SYSCTL")
+    else content='# Managed by vps-tune.'; fi
+    awk -v target="$QDISC" '
+        /^[[:space:]]*-?net\.core\.default_qdisc[[:space:]]*=/ {
+            if(!written) print "-net.core.default_qdisc = " target;
+            written=1; next
+        }
+        {print}
+        END {if(!written) print "-net.core.default_qdisc = " target}' <<< "$content" | write_file "$SYSCTL"
+    content=
+    [[ ! -f $modules ]] || content=$(cat "$modules")
+    awk -v target="$QDISC" '
+        /^[[:space:]]*sch_(cake|fq|fq_codel)([[:space:]]*(#.*)?)?$/ {next}
+        NF {print}
+        END {print "sch_" target}' <<< "$content" | write_file "$modules"
+}
+
+switch_queue() {
+    local interface output root kind parent required current index leaves
+    local -a interfaces=() change_interfaces=() change_parents=()
+    local -A snapshots=()
+    print_heading "切换队列：${QDISC^^}"
+    if ((TEST == 0)); then
+        for required in ip tc sysctl modprobe; do
+            command -v "$required" >/dev/null || die "缺少 $required，请先执行常规调优安装基础工具。"
+        done
+        mapfile -t interfaces < <({ ip -o -4 route show default; ip -o -6 route show default; } |
+            awk '{for(i=1;i<NF;i++) if($i=="dev") print $(i+1)}' | sort -u)
+        ((${#interfaces[@]})) || die '未找到默认路由网卡，未修改配置。'
+        # Inspect every interface before making any changes. Complex shaping
+        # hierarchies and rate-limited CAKE need a separate migration plan.
+        for interface in "${interfaces[@]}"; do
+            [[ $interface != */* && $interface != . && $interface != .. ]] || die 'Invalid interface name'
+            output=$(tc qdisc show dev "$interface") || die "无法读取 $interface 的队列，未修改配置。"
+            snapshots[$interface]=$output
+            root=$(awk '$1=="qdisc" {for(i=1;i<=NF;i++) if($i=="root") print $2}' <<< "$output")
+            if grep -Eq 'qdisc cake .*bandwidth [0-9]' <<< "$output" && [[ $QDISC != cake ]]; then
+                die "$interface 已配置 CAKE 限速；请先处理该限速规则，再切换算法。"
+            fi
+            case $root in
+                cake|fq|fq_codel|pfifo_fast)
+                    if [[ $root != "$QDISC" ]]; then change_interfaces+=("$interface"); change_parents+=(root); fi ;;
+                mq)
+                    leaves=0
+                    while read -r kind parent; do
+                        [[ $kind =~ ^(cake|fq|fq_codel|pfifo_fast)$ && $parent =~ ^[[:xdigit:]]*:[[:xdigit:]]+$ ]] || die "$interface 含有复杂子队列，未修改配置。"
+                        leaves=$((leaves+1))
+                        if [[ $kind != "$QDISC" ]]; then change_interfaces+=("$interface"); change_parents+=("$parent"); fi
+                    done < <(awk '$1=="qdisc" && $2!="mq" && $2!="ingress" && $2!="clsact" {
+                        parent=""; for(i=1;i<NF;i++) if($i=="parent") parent=$(i+1);
+                        print $2, parent
+                    }' <<< "$output")
+                    ((leaves)) || die "$interface 的多队列信息不完整，未修改配置。" ;;
+                *) die "$interface 当前为 ${root:-未知} 队列，不自动替换该队列结构。" ;;
+            esac
+            printf '  %s：%s → %s\n' "$interface" "$root" "$QDISC"
+        done
+    fi
+    if ((DRY)); then log '仅预览，未修改队列或配置。'; return 0; fi
+    init_state
+    # Check for external edits/symlinks before touching the running queues.
+    track_file "$SYSCTL"
+    track_file "/etc/modules-load.d/$TAG"
+    if ((TEST == 0)); then
+        modprobe "sch_$QDISC" || die "当前内核无法加载 sch_$QDISC，未切换队列。"
+        save_runtime net.core.default_qdisc
+        install -d -m 700 "$STATE/queue-snapshots"
+        for interface in "${interfaces[@]}"; do
+            if [[ ! -f $STATE/queue-snapshots/$interface.before ]]; then
+                printf '%s\n' "${snapshots[$interface]}" > "$STATE/queue-snapshots/$interface.before"
+            fi
+        done
+        for ((index=0; index<${#change_interfaces[@]}; index++)); do
+            interface=${change_interfaces[index]}; parent=${change_parents[index]}
+            local -a attach=(root)
+            [[ $parent == root ]] || attach=(parent "$parent")
+            if ! tc qdisc replace dev "$interface" "${attach[@]}" "$QDISC"; then
+                warn '切换未全部完成；已更改的队列保留当前状态，开机配置尚未更新。'
+                printf '当前队列：%s\n' "$(menu_qdisc_status)"
+                die '请查看上方错误后重新选择队列算法。'
+            fi
+        done
+        if ! check_qdiscs "$QDISC"; then die '实际队列与目标不一致，未保存开机配置。'; fi
+        if ! sysctl -w "net.core.default_qdisc=$QDISC"; then
+            die '网卡队列已切换，但系统默认队列更新失败，未保存开机配置。'
+        fi
+        current=$(sysctl -n net.core.default_qdisc)
+        [[ $current == "$QDISC" ]] || die '默认队列校验失败，未保存开机配置。'
+    fi
+    persist_queue_choice
+    if ((TEST)); then log '测试配置已保存；未修改运行中的网卡队列。'
+    else
+        log "已切换为 ${QDISC^^}，并保存开机配置。"
+        menu_status_row 网卡队列 qdiscs "$(menu_qdisc_status)"
+    fi
+}
+
+check_qdiscs() {
+    local expected=${1:-$(configured_qdisc)} interface output bad=0
     local -a interfaces=()
     if ! command -v ip >/dev/null || ! command -v tc >/dev/null; then
-        warn 'ip/tc unavailable; actual CAKE queues are unverified'; return 2
+        warn 'ip/tc unavailable; actual queues are unverified'; return 2
     fi
     mapfile -t interfaces < <({ ip -o -4 route show default; ip -o -6 route show default; } |
         awk '{for(i=1;i<NF;i++) if($i=="dev") print $(i+1)}' | sort -u)
-    if ((${#interfaces[@]} == 0)); then warn 'No default-route interface; CAKE is unverified'; return 2; fi
+    if ((${#interfaces[@]} == 0)); then warn 'No default-route interface; queues are unverified'; return 2; fi
     for interface in "${interfaces[@]}"; do
         log "Actual egress qdisc: $interface"
         if ! output=$(tc qdisc show dev "$interface"); then bad=1; continue; fi
         printf '%s\n' "$output"
-        # mq is a valid root when every transmit leaf is cake. ingress/clsact
+        # mq is a valid root when every transmit leaf matches. ingress/clsact
         # are unrelated hooks; don't count them as egress queue disciplines.
-        if ! awk '
+        if ! awk -v expected="$expected" '
             $1=="qdisc" && $2!="ingress" && $2!="clsact" {
-                if ($2=="cake") cake++;
+                if ($2==expected) matched++;
                 else if ($2!="mq") bad=1;
             }
-            END {exit !(cake>0 && !bad)}' <<< "$output"; then
-            warn "$interface is not using CAKE on all egress queues; reboot and inspect network-manager overrides (noqueue/veth ignore the global default)"
+            END {exit !(matched>0 && !bad)}' <<< "$output"; then
+            warn "$interface 未全部使用 $expected；请检查网卡配置或使用菜单 8 切换队列。"
             bad=1
         fi
     done
@@ -922,7 +1051,7 @@ check_status() {
         printf '%s: actual=%s desired=%s\n' "$key" "$actual" "$desired"
         [[ $actual == "$desired" ]] || bad=1
     done < "$SYSCTL"
-    if [[ $(cat /proc/1/comm) == systemd ]]; then
+    if [[ $(cat /proc/1/comm) == systemd && -f /etc/systemd/system.conf.d/$TAG ]]; then
         systemctl show -p DefaultLimitNOFILE -p DefaultLimitNOFILESoft
         local target
         target=$(awk -F= '/^DefaultLimitNOFILE=/ {split($2,a,":"); print a[1]}' /etc/systemd/system.conf.d/$TAG)
@@ -930,14 +1059,14 @@ check_status() {
             actual=$(systemctl show -p "$key" --value)
             [[ $actual == "$target" ]] || bad=1
         done
-    else
+    elif [[ $(cat /proc/1/comm) != systemd ]]; then
         warn 'No systemd PID 1; effective system defaults and boot are unverified'
         bad=1
     fi
-    check_cake_qdiscs || bad=1
+    check_qdiscs || bad=1
     log "Current shell limit: soft=$(ulimit -Sn), hard=$(ulimit -Hn). Re-login for PAM limits."
     if ((bad)); then warn 'CHECK: differences/pending/unverified items exist (exit 2)'; return 2; fi
-    log 'CHECK: inspected runtime values and default-route CAKE queues match. Verify new login sessions separately.'
+    log 'CHECK: inspected runtime values and default-route queues match. Verify new login sessions separately.'
 }
 
 rollback() {
@@ -965,11 +1094,12 @@ rollback() {
     mv -- "$STATE" "$archived"
     log "Configuration restored; audit backup: $archived"
     warn 'Packages/kernels remain installed; running kernel/process limits remain until reboot/restart. To revert kernel, choose the Debian kernel in GRUB first'
+    if [[ -d $archived/queue-snapshots ]]; then warn '开机队列配置已回滚；运行中的网卡队列需手动重启后重新建立。'; fi
 }
 
 menu_read() {
     local prompt=$1 default=${2:-}
-    printf '%s' "$prompt" >&2
+    ui_text accent "$prompt" >&2
     if ! IFS= read -r REPLY; then printf '\n' >&2; return 1; fi
     [[ -n $REPLY ]] || REPLY=$default
 }
@@ -1008,6 +1138,46 @@ menu_base_args() {
     MENU_ARGS=(apply --review --nofile "$MENU_NOFILE" --cpu-level "$MENU_CPU")
     ((TEST == 0)) || MENU_ARGS+=(--container-test)
     ((MENU_DKMS == 0)) || MENU_ARGS+=(--allow-dkms)
+}
+
+menu_intro() {
+    local selected
+    selected=$(configured_qdisc)
+    case $1 in
+        1)
+            print_heading '完整配置'
+            printf '安装/更新 XanMod 内核，配置 BBR + %s、系统文件句柄和网络缓冲。\n' "${selected^^}"
+            printf '完成后需手动重启以启用新内核。\n' ;;
+        2)
+            print_heading '常规调优'
+            printf '保留当前内核，配置 BBR + %s、系统文件句柄和网络缓冲。\n' "${selected^^}"
+            printf '按本机内存设置缓冲上限。\n' ;;
+        3)
+            print_heading '智能带宽调优'
+            printf '保留当前内核，按带宽和参考 RTT 计算缓冲上限，并配置文件句柄及网络参数。\n'
+            printf '支持手动带宽、测速和 JSON 导入；测速会消耗公网流量。\n' ;;
+    esac
+    menu_read '输入 y 确认继续，回车返回 [y/N]：' n || return 1
+    [[ $REPLY == y || $REPLY == Y ]]
+}
+
+menu_queue() {
+    local selected
+    print_heading '切换队列算法'
+    printf '当前默认：%s\n' "$(runtime_value net.core.default_qdisc)"
+    printf '即时切换并保存，使用所选算法的默认参数。\n'
+    menu_item 1 CAKE
+    menu_item 2 FQ
+    menu_item 3 FQ_CODEL
+    menu_item 0 返回 muted
+    menu_read '请选择 [0]：' 0 || return 0
+    case $REPLY in
+        1) selected=cake ;; 2) selected=fq ;; 3) selected=fq_codel ;;
+        0) return 0 ;; *) printf '无效选择，返回菜单。\n'; return 0 ;;
+    esac
+    local -a args=(queue --qdisc "$selected")
+    ((TEST == 0)) || args+=(--container-test)
+    menu_run "${args[@]}"
 }
 
 menu_settings() {
@@ -1154,17 +1324,61 @@ menu_tcp_ceiling() {
         END {if(!valid) printf "未获取"}' <<< "$value"
 }
 
+menu_status_value() {
+    local kind=$1 value=$2 tone=accent
+    if [[ $value == *未获取* || $value == 无默认路由 ]]; then
+        tone=warning
+    else
+        case $kind in
+            kernel) [[ $value != *xanmod* ]] || tone=good ;;
+            congestion) if [[ $value == bbr* ]]; then tone=good; else tone=warning; fi ;;
+            default-qdisc) if [[ $value == "$(configured_qdisc)" ]]; then tone=good; else tone=warning; fi ;;
+            qdiscs)
+                # Green only if every interface matches the selected kind, with no
+                # different leaf discipline hidden among mq queues.
+                if awk -F ' · ' -v expected="$(configured_qdisc)" '
+                    {
+                        for(i=1;i<=NF;i++) {
+                            if(split($i,parts,": ")!=2) {bad=1; continue}
+                            n=split(parts[2],types,"[+]"); matched=0;
+                            for(j=1;j<=n;j++) {
+                                if(types[j]==expected) matched=1;
+                                else if(types[j]!="mq") bad=1;
+                            }
+                            if(!matched) bad=1;
+                        }
+                    }
+                    END {exit (NR==0 || bad)}' <<< "$value"; then tone=good
+                else tone=warning; fi ;;
+        esac
+    fi
+    ui_text "$tone" "$value"
+}
+
+menu_status_row() {
+    printf '%s：' "$1"
+    menu_status_value "$2" "$3"
+    printf '\n'
+}
+
+menu_item() {
+    ui_text "${3:-accent}" "$1."
+    printf ' '
+    ui_text "${3:-plain}" "$2"
+    printf '\n'
+}
+
 show_menu_status() {
     # Re-read on every menu display; selections and saved files are not proof
     # that the running kernel, manager or current process uses those values.
-    printf '当前内核：%s\n' "$(uname -r)"
-    printf '拥塞控制：%s · 默认队列：%s\n' \
-        "$(runtime_value net.ipv4.tcp_congestion_control)" "$(runtime_value net.core.default_qdisc)"
-    printf '网卡队列：%s\n' "$(menu_qdisc_status)"
-    printf '进程句柄：软 %s / 硬 %s\n' "$(ulimit -Sn)" "$(ulimit -Hn)"
-    printf '服务默认句柄：%s\n' "$(menu_service_limits)"
-    printf 'TCP 缓冲上限：收 %s / 发 %s\n\n' \
-        "$(menu_tcp_ceiling net.ipv4.tcp_rmem)" "$(menu_tcp_ceiling net.ipv4.tcp_wmem)"
+    menu_status_row 当前内核 kernel "$(uname -r)"
+    printf '拥塞控制：'; menu_status_value congestion "$(runtime_value net.ipv4.tcp_congestion_control)"
+    printf ' · 默认队列：'; menu_status_value default-qdisc "$(runtime_value net.core.default_qdisc)"; printf '\n'
+    menu_status_row 网卡队列 qdiscs "$(menu_qdisc_status)"
+    menu_status_row 进程句柄 value "软 $(ulimit -Sn) / 硬 $(ulimit -Hn)"
+    menu_status_row 服务默认句柄 value "$(menu_service_limits)"
+    menu_status_row 'TCP 缓冲上限' value "收 $(menu_tcp_ceiling net.ipv4.tcp_rmem) / 发 $(menu_tcp_ceiling net.ipv4.tcp_wmem)"
+    printf '\n'
 }
 
 interactive_menu() {
@@ -1174,21 +1388,28 @@ interactive_menu() {
     SCRIPT_SELF=$(readlink -f -- "${BASH_SOURCE[0]}")
     [[ -f $SCRIPT_SELF ]] || die '请先将脚本保存为本地文件，再打开菜单。'
     while true; do
-        printf '\n====== Debian %s / VPS 系统优化 ======\n' "$VERSION_ID"
+        printf '\n'; ui_text heading "====== Debian $VERSION_ID / VPS 系统优化 ======"; printf '\n'
         show_menu_status
         ((TEST == 0)) || printf '【Docker 测试模式】不改宿主参数、不重启、不发起公网测速。\n'
-        printf '1. 完整配置\n2. 常规调优\n3. 智能带宽调优\n'
-        printf '4. 临时测速\n5. 检查生效状态\n6. 回滚配置\n'
-        printf '7. 参数设置\n8. 重启系统\n0. 退出\n'
+        menu_item 1 完整配置
+        menu_item 2 常规调优
+        menu_item 3 智能带宽调优
+        menu_item 4 临时测速
+        menu_item 5 检查生效状态
+        menu_item 6 回滚配置 warning
+        menu_item 7 参数设置
+        menu_item 8 切换队列算法
+        menu_item 0 退出 muted
         menu_read '请选择 [0]：' 0 || break
         case $REPLY in
             1|2)
                 local choice=$REPLY
+                menu_intro "$choice" || continue
                 menu_base_args
                 if [[ $choice == 1 ]]; then MENU_ARGS+=(--kernel "$MENU_KERNEL"); else MENU_ARGS+=(--kernel skip); fi
                 MENU_ARGS+=(--buffer-mib "$MENU_BUFFER")
                 menu_run "${MENU_ARGS[@]}" ;;
-            3) menu_smart ;;
+            3) if menu_intro 3; then menu_smart; fi ;;
             4)
                 if ((TEST)) || is_container; then printf '容器测试不发起公网测速。\n'; continue; fi
                 if menu_terms; then menu_run measure --accept-speedtest-terms; else printf '已取消测速。\n'; fi ;;
@@ -1202,10 +1423,7 @@ interactive_menu() {
                     if [[ $REPLY == y || $REPLY == Y ]]; then menu_run "${restore_args[@]}"; else printf '已取消回滚。\n'; fi
                 else printf '无法预览回滚，请查看上方原因。\n'; fi ;;
             7) menu_settings ;;
-            8)
-                if ((TEST)) || is_container; then printf '容器内禁止重启宿主系统。\n'; continue; fi
-                menu_read '重启会断开 SSH；输入 REBOOT 确认：' || break
-                if [[ $REPLY == REBOOT ]]; then systemctl reboot; return; else printf '未执行重启。\n'; fi ;;
+            8) menu_queue ;;
             0) break ;;
             *) printf '请选择 0～8。\n' ;;
         esac
@@ -1220,12 +1438,22 @@ main() {
     fi
     parse_args "$@"
     check_os
+    if [[ $ACTION != queue ]]; then QDISC=$(configured_qdisc); fi
     if [[ $ACTION == check ]]; then
         # A pending verification (2) is a normal check result, not an ERR trap.
         if check_status; then exit 0; else exit "$?"; fi
     fi
     ((EUID == 0)) || die 'Run as root'
     if [[ $ACTION == menu ]]; then interactive_menu; return; fi
+    if [[ $ACTION == queue ]]; then
+        if ((DRY == 0)); then
+            preflight
+            exec 9>/run/lock/vps-tune.lock
+            flock -n 9 || die 'Another vps-tune is running'
+        fi
+        switch_queue
+        return
+    fi
     if [[ $ACTION == measure ]]; then
         if ((TEST)) || is_container; then die '容器内禁止公网测速；使用手动数据或 JSON 测试。'; fi
         resolve_bandwidth
@@ -1251,7 +1479,7 @@ main() {
     choose_plan
     if ((REVIEW)); then show_tuning_plan
     else
-        log "Plan: Debian $VERSION_ID ($CODENAME), kernel=${PACKAGE:-skip}, network=BBR+CAKE, nofile=$NOFILE, RAM=${MEM_MIB}MiB, buffer ceiling=${BUFFER}MiB"
+        log "Plan: Debian $VERSION_ID ($CODENAME), kernel=${PACKAGE:-skip}, network=BBR+${QDISC^^}, nofile=$NOFILE, RAM=${MEM_MIB}MiB, buffer ceiling=${BUFFER}MiB"
         if ((SMART)); then log "$(buffer_plan_description)"; fi
     fi
     if ((SMART)); then
