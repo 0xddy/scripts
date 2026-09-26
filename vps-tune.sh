@@ -5,21 +5,18 @@ export LC_ALL=C
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 umask 022
 
-# Legacy on-disk IDs intentionally retained for backup/rollback compatibility.
-STATE=/var/lib/singbox-tune
-TAG=90-singbox-tune.conf
-SYSCTL=/etc/sysctl.d/99-zz-singbox-tune.conf
-KEYRING=/etc/apt/keyrings/singbox-tune-xanmod.gpg
+STATE=/var/lib/vps-tune
+TAG=90-vps-tune.conf
+SYSCTL=/etc/sysctl.d/99-zz-vps-tune.conf
+KEYRING=/etc/apt/keyrings/vps-tune-xanmod.gpg
 ACTION=apply
 KERNEL=lts
 CPU=auto
 NOFILE=1048576
 BUFFER=auto
-SERVICE=sing-box.service
 TEST=0
 DRY=0
 REBOOT=0
-RESTART=0
 ALLOW_DKMS=0
 REVIEW=0
 SMART=0
@@ -67,8 +64,6 @@ Usage: bash vps-tune.sh                    # Chinese interactive menu
   --speedtest-json FILE    Import an existing Ookla JSON result (bytes/sec).
   --speedtest              Run a temporary isolated official Ookla CLI once.
   --accept-speedtest-terms Explicitly accept Ookla license/GDPR for this run.
-  --service NAME.service  Default: sing-box.service (templates supported).
-  --restart-service       Restart an already-running selected service.
   --reboot                Reboot after a successful apply (disconnects SSH).
   --allow-dkms            Proceed despite detected DKMS modules.
   --dry-run               Read-only plan. Does not fetch or install packages.
@@ -80,7 +75,8 @@ No arguments opens the menu; explicit apply installs XanMod LTS and configures
 limits/networking. measure only runs a temporary speed test. Reboot is
 required for the kernel and all new process limits. Existing processes retain
 their limits. rollback restores tracked configuration; it does not remove any
-kernel/packages or automatically reboot. See README.md for scope.
+kernel/packages or automatically reboot. Explicit per-service limits can
+override system defaults; verify workloads after restarting/rebooting.
 Smart mode needs exactly one bandwidth source: --bandwidth-mbps,
 --speedtest-json or --speedtest. It cannot be combined with --buffer-mib.
 Real speed tests consume traffic; container tests/dry runs never launch them.
@@ -91,19 +87,17 @@ parse_args() {
     while (($#)); do
         case $1 in
             menu|apply|check|rollback|measure) ACTION=$1; shift ;;
-            --kernel|--cpu-level|--nofile|--buffer-mib|--service|--smart-profile|--bandwidth-mbps|--rtt-ms|--speedtest-json)
+            --kernel|--cpu-level|--nofile|--buffer-mib|--smart-profile|--bandwidth-mbps|--rtt-ms|--speedtest-json)
                 (($# >= 2)) || die "Missing value for $1"
                 case $1 in
                     --kernel) KERNEL=$2 ;; --cpu-level) CPU=$2 ;;
                     --nofile) NOFILE=$2 ;; --buffer-mib) BUFFER=$2 ;;
-                    --service) SERVICE=$2 ;;
                     --smart-profile) SMART_PROFILE=$2 ;;
                     --bandwidth-mbps) BANDWIDTH=$2 ;;
                     --rtt-ms) RTT_MS=$2 ;;
                     --speedtest-json) SPEEDTEST_JSON=$2 ;;
                 esac
                 shift 2 ;;
-            --restart-service) RESTART=1; shift ;;
             --reboot) REBOOT=1; shift ;;
             --allow-dkms) ALLOW_DKMS=1; shift ;;
             --review) REVIEW=1; shift ;;
@@ -120,9 +114,8 @@ parse_args() {
     [[ $CPU =~ ^(auto|v1|v2|v3)$ ]] || die 'Invalid --cpu-level'
     if [[ ! $NOFILE =~ ^[1-9][0-9]{4,6}$ ]] || ((NOFILE < 65536 || NOFILE > 1048576)); then die 'Invalid --nofile'; fi
     [[ $BUFFER =~ ^(auto|4|8|16|32|64)$ ]] || die 'Invalid --buffer-mib'
-    [[ $SERVICE =~ ^[a-zA-Z0-9_@.-]+\.service$ && $SERVICE != .* ]] || die 'Invalid service name'
-    if ((TEST && (REBOOT || RESTART))); then die 'Container tests cannot reboot/restart services'; fi
-    if [[ $ACTION != apply ]] && ((REBOOT || RESTART)); then die 'Restart/reboot flags require apply'; fi
+    if ((TEST && REBOOT)); then die 'Container tests cannot reboot'; fi
+    if [[ $ACTION != apply ]] && ((REBOOT)); then die 'Reboot flag requires apply'; fi
     if ((REVIEW)) && [[ $ACTION != apply ]]; then die '--review requires apply'; fi
     if [[ $ACTION == measure ]]; then
         [[ -z $BANDWIDTH && -z $SPEEDTEST_JSON && -z $RTT_MS ]] || die 'measure only accepts real Speedtest options'
@@ -168,7 +161,7 @@ validate_smart_args() {
 }
 
 # Independent implementation inspired by Actions-bbr-v3's bandwidth/region
-# tables; see SMART-BANDWIDTH.zh-CN.md for pinned source and intentional changes.
+# tables; BDP profiles also use RTT and apply conservative memory ceilings.
 # Input/output units: RAM MiB -> maximum per-socket buffer MiB.
 smart_memory_cap_mib() {
     local memory=$1
@@ -437,7 +430,7 @@ write_file() {
     local path=$1 tmpfile
     track_file "$path"
     mkdir -p "$(dirname "$path")" "$STATE/expected$(dirname "$path")"
-    tmpfile=$(mktemp "$(dirname "$path")/.singbox-tune.XXXXXX")
+    tmpfile=$(mktemp "$(dirname "$path")/.vps-tune.XXXXXX")
     cat > "$tmpfile"
     chmod 644 "$tmpfile"
     mv -f -- "$tmpfile" "$path"
@@ -453,7 +446,7 @@ install_kernel() {
     apt_update
     apt_install ca-certificates curl gnupg kmod procps iproute2 initramfs-tools
     local existing_repo
-    existing_repo=$(grep -rlE '^[[:space:]]*(deb[[:space:]]|URIs:).*deb\.xanmod\.org' /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null | grep -v '/singbox-tune-xanmod.list$' || true)
+    existing_repo=$(grep -rlE '^[[:space:]]*(deb[[:space:]]|URIs:).*deb\.xanmod\.org' /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null | grep -v '/vps-tune-xanmod.list$' || true)
     if [[ -n $existing_repo ]]; then
         log "Reusing existing XanMod source(s): $existing_repo"
     else
@@ -468,11 +461,11 @@ install_kernel() {
     [[ $fingerprint == D38D7D1DA1349567ADED882D86F7D09EE734E623 ]] || die 'XanMod signing key changed; verify it against the official source before updating this script'
     gpg --batch --yes --dearmor -o "$TMP/archive.gpg" "$TMP/archive.key"
     write_file "$KEYRING" < "$TMP/archive.gpg"
-    write_file /etc/apt/sources.list.d/singbox-tune-xanmod.list <<EOF
+    write_file /etc/apt/sources.list.d/vps-tune-xanmod.list <<EOF
 deb [arch=amd64 signed-by=$KEYRING] https://deb.xanmod.org $CODENAME main
 EOF
     fi
-    write_file /etc/apt/preferences.d/singbox-tune-xanmod <<'EOF'
+    write_file /etc/apt/preferences.d/vps-tune-xanmod <<'EOF'
 Package: linux-*xanmod*
 Pin: origin "deb.xanmod.org"
 Pin-Priority: 700
@@ -518,23 +511,23 @@ configure_grub() {
     [[ $boot_id =~ ^[a-zA-Z0-9_-]+$ ]] || die 'Unrecognized GRUB device ID'
     submenu=
     if grep -Fq "'gnulinux-advanced-$boot_id'" /boot/grub/grub.cfg; then submenu="gnulinux-advanced-$boot_id>"; fi
-    write_file /etc/default/grub.d/90-singbox-tune.cfg <<EOF
+    write_file /etc/default/grub.d/90-vps-tune.cfg <<EOF
 # Evaluated by grub-mkconfig. Follow this metapackage after future APT updates.
 # APT unpacks the metapackage before configuring image packages/triggers.
-singbox_image=\$(dpkg-query -W -f='\${Depends}\\n' '$PACKAGE' 2>/dev/null | tr ',' '\\n' | awk '/linux-image-/ {print \$1; exit}')
-singbox_release=\${singbox_image#linux-image-}
-if [ -s "/boot/vmlinuz-\$singbox_release" ]; then
-    GRUB_DEFAULT="${submenu}gnulinux-\${singbox_release}-advanced-$boot_id"
+vps_image=\$(dpkg-query -W -f='\${Depends}\\n' '$PACKAGE' 2>/dev/null | tr ',' '\\n' | awk '/linux-image-/ {print \$1; exit}')
+vps_release=\${vps_image#linux-image-}
+if [ -s "/boot/vmlinuz-\$vps_release" ]; then
+    GRUB_DEFAULT="${submenu}gnulinux-\${vps_release}-advanced-$boot_id"
 else
     GRUB_DEFAULT='$submenu$entry'
 fi
 GRUB_SAVEDEFAULT=false
-unset singbox_image singbox_release
+unset vps_image vps_release
 EOF
 }
 
 configure_limits() {
-    write_file /etc/security/limits.d/90-singbox-tune.conf <<EOF
+    write_file /etc/security/limits.d/90-vps-tune.conf <<EOF
 # PAM limits for new sessions. Root needs explicit entries.
 * soft nofile $NOFILE
 * hard nofile $NOFILE
@@ -547,7 +540,7 @@ EOF
         if ! grep -Eq '^[[:space:]]*session[[:space:]].*pam_limits\.so([[:space:]]|$)' "$path"; then
             local content
             content=$(cat "$path")
-            printf '%s\nsession required pam_limits.so # singbox-tune\n' "$content" | write_file "$path"
+            printf '%s\nsession required pam_limits.so # vps-tune\n' "$content" | write_file "$path"
         fi
     done
     for path in /etc/systemd/system.conf.d/$TAG /etc/systemd/user.conf.d/$TAG; do
@@ -557,17 +550,15 @@ DefaultLimitNOFILE=$NOFILE:$NOFILE
 EOF
     done
     # user@.service ensures a fresh user manager can raise its children's limits.
-    for path in "/etc/systemd/system/$SERVICE.d/$TAG" "/etc/systemd/system/user@.service.d/$TAG"; do
-        write_file "$path" <<EOF
+    write_file "/etc/systemd/system/user@.service.d/$TAG" <<EOF
 [Service]
 LimitNOFILE=$NOFILE:$NOFILE
 EOF
-    done
 }
 
 configure_network() {
     write_file "$SYSCTL" <<EOF
-# Managed by singbox-tune. Values are ceilings, not preallocated buffers.
+# Managed by vps-tune. Values are ceilings, not preallocated buffers.
 # Buffer plan: $(buffer_plan_description)
 fs.file-max = $FS_MAX
 fs.nr_open = $NR_OPEN
@@ -588,7 +579,7 @@ net.ipv4.tcp_mtu_probing = 1
 -net.core.default_qdisc = cake
 -net.ipv4.tcp_congestion_control = bbr
 EOF
-    write_file /etc/modules-load.d/90-singbox-tune.conf <<'EOF'
+    write_file /etc/modules-load.d/90-vps-tune.conf <<'EOF'
 tcp_bbr
 sch_cake
 EOF
@@ -641,9 +632,6 @@ apply_runtime() {
     ((failed == 0)) || die 'One or more required sysctls failed; configuration remains available for inspection/rollback'
     systemctl daemon-reload
     systemctl daemon-reexec
-    if ((RESTART)) && systemctl is-active --quiet "$SERVICE"; then
-        systemctl restart "$SERVICE"
-    fi
 }
 
 check_cake_qdiscs() {
@@ -675,7 +663,7 @@ check_cake_qdiscs() {
 }
 
 check_status() {
-    local bad=0 line key desired actual pid kernel_target image_pkg
+    local bad=0 line key desired actual kernel_target image_pkg
     log "OS: Debian $VERSION_ID; running kernel: $(uname -r)"
     if [[ -f $STATE/kernel-release ]]; then
         kernel_target=$(cat "$STATE/kernel-release")
@@ -697,26 +685,15 @@ check_status() {
         [[ $actual == "$desired" ]] || bad=1
     done < "$SYSCTL"
     if [[ $(cat /proc/1/comm) == systemd ]]; then
-        [[ ! -f $STATE/service ]] || SERVICE=$(cat "$STATE/service")
         systemctl show -p DefaultLimitNOFILE -p DefaultLimitNOFILESoft
-        systemctl show "$SERVICE" -p LoadState -p LimitNOFILE -p LimitNOFILESoft -p MainPID
-        local target hard soft
+        local target
         target=$(awk -F= '/^DefaultLimitNOFILE=/ {split($2,a,":"); print a[1]}' /etc/systemd/system.conf.d/$TAG)
         for key in DefaultLimitNOFILE DefaultLimitNOFILESoft; do
             actual=$(systemctl show -p "$key" --value)
             [[ $actual == "$target" ]] || bad=1
         done
-        pid=$(systemctl show "$SERVICE" -p MainPID --value)
-        if [[ $pid =~ ^[1-9][0-9]*$ && -r /proc/$pid/limits ]]; then
-            grep 'Max open files' "/proc/$pid/limits"
-            read -r soft hard < <(awk '/Max open files/ {print $4, $5}' "/proc/$pid/limits")
-            [[ $soft == "$target" && $hard == "$target" ]] || bad=1
-        else
-            warn "$SERVICE is not running; its process limit is unverified"
-            bad=1
-        fi
     else
-        warn 'No systemd PID 1; effective service limits and boot are unverified'
+        warn 'No systemd PID 1; effective system defaults and boot are unverified'
         bad=1
     fi
     check_cake_qdiscs || bad=1
@@ -744,7 +721,7 @@ rollback() {
         done < "$STATE/runtime.before"
         systemctl daemon-reload
         systemctl daemon-reexec
-        if grep -qF '/etc/default/grub.d/90-singbox-tune.cfg' "$STATE/manifest"; then update-grub; fi
+        if grep -qF '/etc/default/grub.d/90-vps-tune.cfg' "$STATE/manifest"; then update-grub; fi
     fi
     archived="${STATE}.rolled-back.$(date +%Y%m%d%H%M%S).$$"
     mv -- "$STATE" "$archived"
@@ -790,7 +767,7 @@ menu_run() {
 }
 
 menu_base_args() {
-    MENU_ARGS=(apply --review --service "$MENU_SERVICE" --nofile "$MENU_NOFILE" --cpu-level "$MENU_CPU")
+    MENU_ARGS=(apply --review --nofile "$MENU_NOFILE" --cpu-level "$MENU_CPU")
     ((TEST == 0)) || MENU_ARGS+=(--container-test)
     ((MENU_DKMS == 0)) || MENU_ARGS+=(--allow-dkms)
 }
@@ -798,34 +775,30 @@ menu_base_args() {
 menu_settings() {
     while true; do
         printf '\n参数设置（仅本次菜单会话）\n'
-        printf '1. 服务名：%s\n2. 文件句柄：%s\n3. 内核分支：%s\n4. CPU 等级：%s\n5. 常规缓冲档：%s MiB\n6. 允许已有 DKMS：%s\n0. 返回\n' \
-            "$MENU_SERVICE" "$MENU_NOFILE" "$MENU_KERNEL" "$MENU_CPU" "$MENU_BUFFER" "$MENU_DKMS"
+        printf '1. 文件句柄：%s\n2. 内核分支：%s\n3. CPU 等级：%s\n4. 常规缓冲档：%s MiB\n5. 允许已有 DKMS：%s\n0. 返回\n' \
+            "$MENU_NOFILE" "$MENU_KERNEL" "$MENU_CPU" "$MENU_BUFFER" "$MENU_DKMS"
         menu_read '请选择：' || return 0
         case $REPLY in
             1)
-                menu_read '输入服务名，例如 sing-box.service：' "$MENU_SERVICE" || return 0
-                if [[ $REPLY =~ ^[a-zA-Z0-9_@.-]+\.service$ && $REPLY != .* ]]; then MENU_SERVICE=$REPLY
-                else printf '服务名不合法。\n'; fi ;;
-            2)
                 menu_read '输入文件句柄上限（65536～1048576）：' "$MENU_NOFILE" || return 0
                 if [[ $REPLY =~ ^[1-9][0-9]{4,6}$ ]] && ((REPLY >= 65536 && REPLY <= 1048576)); then MENU_NOFILE=$REPLY
                 else printf '文件句柄数量不合法。\n'; fi ;;
-            3)
+            2)
                 menu_read '内核分支：lts（推荐）或 main：' lts || return 0
                 if [[ $REPLY == lts || ( $REPLY == main && $VERSION_ID == 13 ) ]]; then MENU_KERNEL=$REPLY
                 else printf 'Debian 12 仅支持 LTS；Debian 13 支持 lts/main。\n'; fi ;;
-            4)
+            3)
                 menu_read 'CPU 等级：auto / v1 / v2 / v3：' auto || return 0
                 if [[ $REPLY =~ ^(auto|v1|v2|v3)$ ]]; then MENU_CPU=$REPLY; else printf '无效 CPU 等级。\n'; fi ;;
-            5)
+            4)
                 menu_read '常规缓冲档：auto / 4 / 8 / 16 / 32 / 64：' auto || return 0
                 if [[ $REPLY =~ ^(auto|4|8|16|32|64)$ ]]; then MENU_BUFFER=$REPLY; else printf '无效缓冲档位。\n'; fi ;;
-            6)
+            5)
                 menu_read '已自行核实 DKMS 模块兼容性？允许继续输入 y [y/N]：' n || return 0
                 MENU_DKMS=0
                 [[ $REPLY != y && $REPLY != Y ]] || MENU_DKMS=1 ;;
             0) return 0 ;;
-            *) printf '请选择 0～6。\n' ;;
+            *) printf '请选择 0～5。\n' ;;
         esac
     done
 }
@@ -876,14 +849,14 @@ menu_smart() {
 }
 
 interactive_menu() {
-    local SCRIPT_SELF MENU_SERVICE=$SERVICE MENU_NOFILE=$NOFILE MENU_KERNEL=$KERNEL
+    local SCRIPT_SELF MENU_NOFILE=$NOFILE MENU_KERNEL=$KERNEL
     local MENU_CPU=$CPU MENU_BUFFER=$BUFFER MENU_DKMS=$ALLOW_DKMS
     local -a MENU_ARGS=()
     SCRIPT_SELF=$(readlink -f -- "${BASH_SOURCE[0]}")
     [[ -f $SCRIPT_SELF ]] || die '请先将脚本保存为本地文件，再打开菜单。'
     while true; do
         printf '\n====== Debian %s / VPS 系统优化 ======\n' "$VERSION_ID"
-        printf '当前内核：%s\n服务：%s    文件句柄：%s\n' "$(uname -r)" "$MENU_SERVICE" "$MENU_NOFILE"
+        printf '当前内核：%s\n全局文件句柄默认值：%s\n' "$(uname -r)" "$MENU_NOFILE"
         ((TEST == 0)) || printf '【Docker 测试模式】不改宿主参数、不重启、不发起公网测速。\n'
         printf '网络目标：BBR + CAKE（持久化配置，重启后检查网卡队列）\n'
         printf '1. 完整配置（XanMod + BBR/CAKE + 文件句柄）\n'
@@ -902,7 +875,7 @@ interactive_menu() {
             4)
                 if ((TEST)) || is_container; then printf '容器测试不发起公网测速。\n'; continue; fi
                 if menu_terms; then menu_run measure --accept-speedtest-terms; else printf '已取消测速。\n'; fi ;;
-            5) menu_run check --service "$MENU_SERVICE" ;;
+            5) menu_run check ;;
             6)
                 local -a restore_args=(rollback)
                 ((TEST == 0)) || restore_args+=(--container-test)
@@ -947,19 +920,19 @@ main() {
         KERNEL=skip
         preflight
         if ((DRY)); then rollback; return; fi
-        exec 9>/run/lock/singbox-tune.lock
-        flock -n 9 || die 'Another vps-tune / compatible legacy script is running'
+        exec 9>/run/lock/vps-tune.lock
+        flock -n 9 || die 'Another vps-tune is running'
         rollback
         return
     fi
     if ((DRY == 0)); then
         preflight
-        exec 9>/run/lock/singbox-tune.lock
-        flock -n 9 || die 'Another vps-tune / compatible legacy script is running'
+        exec 9>/run/lock/vps-tune.lock
+        flock -n 9 || die 'Another vps-tune is running'
     fi
     resolve_bandwidth
     choose_plan
-    log "Plan: Debian $VERSION_ID ($CODENAME), kernel=${PACKAGE:-skip}, network=BBR+CAKE, nofile=$NOFILE, RAM=${MEM_MIB}MiB, buffer ceiling=${BUFFER}MiB, service=$SERVICE"
+    log "Plan: Debian $VERSION_ID ($CODENAME), kernel=${PACKAGE:-skip}, network=BBR+CAKE, nofile=$NOFILE, RAM=${MEM_MIB}MiB, buffer ceiling=${BUFFER}MiB"
     if ((SMART)); then
         log "$(buffer_plan_description)"
         if ((SMART_WANTED_MIB > SMART_CAP_MIB)); then warn 'Requested buffer exceeds memory cap; capped. This may limit a high-BDP flow'; fi
@@ -983,7 +956,6 @@ main() {
     install_kernel
     configure_limits
     configure_network
-    printf '%s\n' "$SERVICE" > "$STATE/service"
     apply_runtime
     log 'Configuration installed. First-run originals retained for rollback.'
     if ((TEST)); then
