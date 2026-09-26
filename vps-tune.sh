@@ -1099,11 +1099,9 @@ interactive_menu() {
         printf '\n====== Debian %s / VPS 系统优化 ======\n' "$VERSION_ID"
         printf '当前内核：%s\n全局文件句柄默认值：%s\n' "$(uname -r)" "$MENU_NOFILE"
         ((TEST == 0)) || printf '【Docker 测试模式】不改宿主参数、不重启、不发起公网测速。\n'
-        printf '网络目标：BBR + CAKE（持久化配置，重启后检查网卡队列）\n'
-        printf '1. 完整配置（XanMod + BBR/CAKE + 文件句柄）\n'
-        printf '2. 常规调优（BBR/CAKE，保留当前内核）\n3. 智能带宽调优（保留当前内核）\n'
-        printf '4. 临时测速（只测速，不修改调优配置）\n5. 检查实际生效状态\n'
-        printf '6. 回滚调优配置\n7. 参数设置\n8. 重启系统\n0. 退出\n'
+        printf '1. 完整配置\n2. 常规调优\n3. 智能带宽调优\n'
+        printf '4. 临时测速\n5. 检查生效状态\n6. 回滚配置\n'
+        printf '7. 参数设置\n8. 重启系统\n0. 退出\n'
         menu_read '请选择 [0]：' 0 || break
         case $REPLY in
             1|2)
