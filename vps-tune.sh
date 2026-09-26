@@ -337,35 +337,67 @@ cn_rtt_targets() {
         'gd CT 广东电信' 'gd CU 广东联通' 'gd CM 广东移动'
 }
 
-probe_cn_site() {
-    local host=$1 output=$2 attempt metrics address dns connect
-    for ((attempt=1; attempt<=3; attempt++)); do
-        # Disable curlrc/proxies; DNS time is excluded from the TCP interval.
-        # HTTP failures after a successful handshake do not erase its RTT.
-        metrics=$(curl -q --noproxy '*' -4 -s --head --connect-timeout 2 \
-            --max-time 3 -o /dev/null -w '%{remote_ip} %{time_namelookup} %{time_connect}' \
-            "http://$host/") || true
-        read -r address dns connect <<< "$metrics"
-        [[ $address =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || continue
-        case $address in 0.*|10.*|127.*|169.254.*|192.168.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*) continue ;; esac
-        [[ $dns =~ ^[0-9]+(\.[0-9]+)?$ && $connect =~ ^[0-9]+(\.[0-9]+)?$ ]] || continue
-        awk -v ip="$address" -v dns="$dns" -v connected="$connect" 'BEGIN {
-            rtt=(connected-dns)*1000;
-            if (rtt>0 && rtt<=5000) printf "%s %.3f\n", ip, rtt;
+cn_site_summary() {
+    sort -k2,2n "$1" | awk '
+        NF==2 {n++; ip[n]=$1; value[n]=$2}
+        END {
+            if(!n) exit;
+            mid=(n%2 ? value[int(n/2)+1] : (value[n/2]+value[n/2+1])/2);
+            printf "%s %.3f %d %.3f\n", ip[int(n/2)+1], mid, n, value[n]-value[1];
         }'
-    done > "$output"
+}
+
+probe_cn_sample() {
+    local host=$1 metrics address dns connect
+    # Disable curlrc/proxies; DNS time is excluded from the TCP interval.
+    # HTTP failures after a successful handshake do not erase its RTT.
+    metrics=$(curl -q --noproxy '*' -4 -s --head --connect-timeout 2 \
+        --max-time 3 -o /dev/null -w '%{remote_ip} %{time_namelookup} %{time_connect}' \
+        "http://$host/") || true
+    read -r address dns connect <<< "$metrics" || return 0
+    [[ $address =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 0
+    case $address in 0.*|10.*|127.*|169.254.*|192.168.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*) return 0 ;; esac
+    [[ $dns =~ ^[0-9]+(\.[0-9]+)?$ && $connect =~ ^[0-9]+(\.[0-9]+)?$ ]] || return 0
+    awk -v ip="$address" -v dns="$dns" -v connected="$connect" 'BEGIN {
+        rtt=(connected-dns)*1000;
+        if (rtt>0 && rtt<=5000) printf "%s %.3f\n", ip, rtt;
+    }'
+}
+
+probe_cn_site() {
+    local host=$1 output=$2 attempt limit=7 result address median count spread
+    : > "$output"
+    for ((attempt=1; attempt<=limit; attempt++)); do
+        ((attempt == 1)) || sleep 0.2
+        probe_cn_sample "$host" >> "$output"
+        if ((attempt == 7)); then
+            result=$(cn_site_summary "$output")
+            if [[ -z $result ]]; then
+                limit=11
+            else
+                read -r address median count spread <<< "$result"
+                # Retest a range exceeding both 50 ms and half the median.
+                # Keep all samples: sustained high RTT must not be hidden.
+                if ((count < 5)) || awk -v mid="$median" -v spread="$spread" \
+                    'BEGIN {exit !(spread>50 && spread>mid*0.5)}'; then
+                    limit=11
+                fi
+            fi
+        fi
+    done
+    printf '%s\n' "$limit" > "$output.attempts"
 }
 
 resolve_rtt() {
     ((RTT_AUTO)) || return 0
     command -v curl >/dev/null || die '大陆 RTT 探测需要已有 curl；也可选择区域参考值或手填 RTT。'
     ensure_tmp
-    local directory=$TMP/cn-rtt region isp label host key result address median count
+    local directory=$TMP/cn-rtt region isp label host key result address median count spread attempts note
     local successful=0 failed=0 regions=0 provider_count=0 pid
     local -a jobs=()
     local -A seen=() covered_region=() covered_isp=()
     mkdir -p "$directory"
-    log '探测北京、上海、广东的电信/联通/移动公开测点：每点 3 次 TCP 连接，约 10 秒。'
+    log '探测北京、上海、广东三网：每点 7 次；波动较大或样本不足时追加 4 次。'
     start_spinner '正在探测大陆三网 RTT'
     while read -r region isp label; do
         host="$region-${isp,,}-v4.ip.zstaticcdn.com"
@@ -378,18 +410,15 @@ resolve_rtt() {
     : > "$directory/medians"
     while read -r region isp label; do
         key=$region-$isp
-        result=$(sort -k2,2n "$directory/$key" | awk '
-            NF==2 {ip[NR]=$1; value[NR]=$2; n++}
-            END {
-                if(n<2) exit;
-                mid=(n%2 ? value[int(n/2)+1] : (value[n/2]+value[n/2+1])/2);
-                printf "%s %.3f %d\n", ip[int(n/2)+1], mid, n;
-            }')
-        if [[ -z $result ]]; then
-            printf '  %-12s 无有效样本（至少需 2/3 次连接成功）\n' "$label"
+        attempts=$(<"$directory/$key.attempts")
+        result=$(cn_site_summary "$directory/$key")
+        address=; median=; count=0; spread=
+        if [[ -n $result ]]; then read -r address median count spread <<< "$result"; fi
+        note=; if ((attempts > 7)); then note='，含复测'; fi
+        if ((count < 5)); then
+            printf '  %-12s 样本不足（有效 %s/%s%s，至少需 5 次）\n' "$label" "$count" "$attempts" "$note"
             failed=$((failed + 1)); continue
         fi
-        read -r address median count <<< "$result"
         if [[ -n ${seen[$address]:-} ]]; then
             printf '  %-12s %s ms，测点 IP 重复，不重复计权\n' "$label" "$median"
             continue
@@ -397,11 +426,11 @@ resolve_rtt() {
         seen[$address]=1; covered_region[$region]=1; covered_isp[$isp]=1
         successful=$((successful + 1))
         printf '%s\n' "$median" >> "$directory/medians"
-        printf '  %-12s %s ms（%s/3；%s）\n' "$label" "$median" "$count" "$address"
+        printf '  %-12s %s ms（有效 %s/%s%s；%s）\n' "$label" "$median" "$count" "$attempts" "$note" "$address"
     done < <(cn_rtt_targets)
     regions=${#covered_region[@]}; provider_count=${#covered_isp[@]}
-    if ((successful < 3 || regions < 2 || provider_count < 3)); then
-        die "大陆 RTT 样本覆盖不足（有效 $successful/9；地区 $regions/3；运营商 $provider_count/3）。未使用猜测值，请选择区域参考值或手填 RTT。"
+    if ((successful < 5 || regions < 2 || provider_count < 3)); then
+        die "大陆 RTT 样本覆盖不足（有效 $successful/9，至少需 5 个测点；地区 $regions/3；运营商 $provider_count/3）。请选择区域参考值或手填 RTT。"
     fi
     RTT_MS=$(sort -n "$directory/medians" | awk '
         {v[NR]=$1} END {rank=int((NR*3+3)/4); r=v[rank]; n=int(r); if(n<r) n++; print n}')
