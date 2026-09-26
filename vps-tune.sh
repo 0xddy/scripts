@@ -23,6 +23,8 @@ SMART=0
 SMART_PROFILE=bdp
 BANDWIDTH=
 RTT_MS=
+RTT_AUTO=0
+RTT_SOURCE=
 SPEEDTEST=0
 SPEEDTEST_JSON=
 ACCEPT_SPEEDTEST=0
@@ -60,7 +62,8 @@ Usage: bash vps-tune.sh                    # Chinese interactive menu
   --smart-profile bdp|asia-bdp|overseas-bdp|asia|overseas
                           Region BDP: planning RTT 100/200ms. asia/overseas: tables.
   --bandwidth-mbps NUMBER  Target bottleneck/egress bandwidth, decimal Mbit/s.
-  --rtt-ms NUMBER          Real business-path TCP RTT; required for BDP.
+  --rtt-ms NUMBER          Representative TCP RTT; alternative to --auto-rtt.
+  --auto-rtt               Probe mainland TCP RTT; use P75 of valid site medians.
   --speedtest-json FILE    Import an existing Ookla JSON result (bytes/sec).
   --speedtest              Run a temporary isolated official Ookla CLI once.
   --accept-speedtest-terms Explicitly accept Ookla license/GDPR for this run.
@@ -102,6 +105,7 @@ parse_args() {
             --allow-dkms) ALLOW_DKMS=1; shift ;;
             --review) REVIEW=1; shift ;;
             --smart-bandwidth) SMART=1; shift ;;
+            --auto-rtt) RTT_AUTO=1; shift ;;
             --speedtest) SPEEDTEST=1; shift ;;
             --accept-speedtest-terms) ACCEPT_SPEEDTEST=1; shift ;;
             --container-test) TEST=1; shift ;;
@@ -118,7 +122,7 @@ parse_args() {
     if [[ $ACTION != apply ]] && ((REBOOT)); then die 'Reboot flag requires apply'; fi
     if ((REVIEW)) && [[ $ACTION != apply ]]; then die '--review requires apply'; fi
     if [[ $ACTION == measure ]]; then
-        [[ -z $BANDWIDTH && -z $SPEEDTEST_JSON && -z $RTT_MS ]] || die 'measure only accepts real Speedtest options'
+        if [[ -n $BANDWIDTH || -n $SPEEDTEST_JSON || -n $RTT_MS ]] || ((RTT_AUTO)); then die 'measure only accepts real Speedtest options'; fi
         SMART=1; SPEEDTEST=1; SMART_PROFILE=asia
     fi
     validate_smart_args
@@ -132,12 +136,16 @@ valid_positive() {
 validate_smart_args() {
     [[ $SMART_PROFILE =~ ^(bdp|asia-bdp|overseas-bdp|asia|overseas)$ ]] || die 'Invalid --smart-profile'
     if ((SMART == 0)); then
-        if [[ -n $BANDWIDTH || -n $RTT_MS || -n $SPEEDTEST_JSON || $SMART_PROFILE != bdp ]] || ((SPEEDTEST || ACCEPT_SPEEDTEST)); then
+        if [[ -n $BANDWIDTH || -n $RTT_MS || -n $SPEEDTEST_JSON || $SMART_PROFILE != bdp ]] || ((SPEEDTEST || ACCEPT_SPEEDTEST || RTT_AUTO)); then
             die 'Bandwidth options require --smart-bandwidth'
         fi
         return 0
     fi
     [[ $ACTION == apply || $ACTION == measure ]] || die 'Bandwidth options are only for apply/measure'
+    if ((RTT_AUTO)); then
+        [[ $SMART_PROFILE == bdp && -z $RTT_MS ]] || die '--auto-rtt requires profile bdp and cannot be combined with --rtt-ms'
+        ((TEST == 0 && DRY == 0)) || die 'RTT probing is disabled in dry-run/container-test; use manual RTT or a region profile'
+    fi
     case $SMART_PROFILE in
         asia-bdp|overseas-bdp)
             [[ -z $RTT_MS ]] || die 'Region BDP supplies a planning RTT; use profile bdp for a custom RTT'
@@ -150,7 +158,7 @@ validate_smart_args() {
     [[ -z $SPEEDTEST_JSON ]] || sources=$((sources + 1))
     ((sources == 1)) || die 'Smart mode needs exactly one bandwidth source'
     if [[ -n $BANDWIDTH ]] && ! valid_positive "$BANDWIDTH" 100000; then die 'Bandwidth must be > 0 and <= 100000 Mbit/s'; fi
-    if [[ $SMART_PROFILE == bdp && -z $RTT_MS ]]; then die 'BDP mode requires --rtt-ms from the real business path'; fi
+    if [[ $SMART_PROFILE == bdp && -z $RTT_MS ]] && ((RTT_AUTO == 0)); then die 'BDP mode requires --rtt-ms or --auto-rtt'; fi
     if [[ -n $RTT_MS ]] && ! valid_positive "$RTT_MS" 5000; then die 'RTT must be > 0 and <= 5000 ms'; fi
     if ((SPEEDTEST)); then
         ((TEST == 0 && DRY == 0)) || die 'Real Speedtest is disabled in dry-run/container-test; use manual bandwidth or a JSON file'
@@ -215,6 +223,91 @@ ensure_tmp() {
     [[ -n $TMP ]] || TMP=$(mktemp -d /tmp/vps-tune.XXXXXXXX)
 }
 
+# NodeQuality delegates mainland delay tests to xykt/NetQuality, whose
+# province/operator targets use <province>-<ct|cu|cm>-v4.ip.zstaticcdn.com.
+# Reference: https://github.com/xykt/NetQuality/tree/d5b99484d51286374d24b892c1b54235dc282148
+# This independent lightweight probe measures TCP handshakes, not MTR's
+# 1400-byte probes, route hops, one-way latency, or end-user connection RTT.
+cn_rtt_targets() {
+    printf '%s\n' 'bj CT 北京电信' 'bj CU 北京联通' 'bj CM 北京移动' \
+        'sh CT 上海电信' 'sh CU 上海联通' 'sh CM 上海移动' \
+        'gd CT 广东电信' 'gd CU 广东联通' 'gd CM 广东移动'
+}
+
+probe_cn_site() {
+    local host=$1 output=$2 attempt metrics address dns connect
+    for ((attempt=1; attempt<=3; attempt++)); do
+        # Disable curlrc/proxies; DNS time is excluded from the TCP interval.
+        # HTTP failures after a successful handshake do not erase its RTT.
+        metrics=$(curl -q --noproxy '*' -4 -s --head --connect-timeout 2 \
+            --max-time 3 -o /dev/null -w '%{remote_ip} %{time_namelookup} %{time_connect}' \
+            "http://$host/") || true
+        read -r address dns connect <<< "$metrics"
+        [[ $address =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || continue
+        case $address in 0.*|10.*|127.*|169.254.*|192.168.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*) continue ;; esac
+        [[ $dns =~ ^[0-9]+(\.[0-9]+)?$ && $connect =~ ^[0-9]+(\.[0-9]+)?$ ]] || continue
+        awk -v ip="$address" -v dns="$dns" -v connected="$connect" 'BEGIN {
+            rtt=(connected-dns)*1000;
+            if (rtt>0 && rtt<=5000) printf "%s %.3f\n", ip, rtt;
+        }'
+    done > "$output"
+}
+
+resolve_rtt() {
+    ((RTT_AUTO)) || return 0
+    command -v curl >/dev/null || die '大陆 RTT 探测需要已有 curl；也可选择区域参考值或手填 RTT。'
+    ensure_tmp
+    local directory=$TMP/cn-rtt region isp label host key result address median count
+    local successful=0 failed=0 regions=0 provider_count=0 pid
+    local -a jobs=()
+    local -A seen=() covered_region=() covered_isp=()
+    mkdir -p "$directory"
+    log '探测北京、上海、广东的电信/联通/移动公开测点：每点 3 次 TCP 连接，约 10 秒。'
+    while read -r region isp label; do
+        host="$region-${isp,,}-v4.ip.zstaticcdn.com"
+        probe_cn_site "$host" "$directory/$region-$isp" &
+        jobs+=("$!")
+    done < <(cn_rtt_targets)
+    for pid in "${jobs[@]}"; do wait "$pid" || true; done
+    : > "$directory/medians"
+    while read -r region isp label; do
+        key=$region-$isp
+        result=$(sort -k2,2n "$directory/$key" | awk '
+            NF==2 {ip[NR]=$1; value[NR]=$2; n++}
+            END {
+                if(n<2) exit;
+                mid=(n%2 ? value[int(n/2)+1] : (value[n/2]+value[n/2+1])/2);
+                printf "%s %.3f %d\n", ip[int(n/2)+1], mid, n;
+            }')
+        if [[ -z $result ]]; then
+            printf '  %-12s 无有效样本（至少需 2/3 次连接成功）\n' "$label"
+            failed=$((failed + 1)); continue
+        fi
+        read -r address median count <<< "$result"
+        if [[ -n ${seen[$address]:-} ]]; then
+            printf '  %-12s %s ms，测点 IP 重复，不重复计权\n' "$label" "$median"
+            continue
+        fi
+        seen[$address]=1; covered_region[$region]=1; covered_isp[$isp]=1
+        successful=$((successful + 1))
+        printf '%s\n' "$median" >> "$directory/medians"
+        printf '  %-12s %s ms（%s/3；%s）\n' "$label" "$median" "$count" "$address"
+    done < <(cn_rtt_targets)
+    regions=${#covered_region[@]}; provider_count=${#covered_isp[@]}
+    if ((successful < 3 || regions < 2 || provider_count < 3)); then
+        die "大陆 RTT 样本覆盖不足（有效 $successful/9；地区 $regions/3；运营商 $provider_count/3）。未使用猜测值，请选择区域参考值或手填 RTT。"
+    fi
+    RTT_MS=$(sort -n "$directory/medians" | awk '
+        {v[NR]=$1} END {rank=int((NR*3+3)/4); r=v[rank]; n=int(r); if(n<r) n++; print n}')
+    valid_positive "$RTT_MS" 5000 || die 'Invalid measured RTT; no configuration was changed'
+    # Sub-millisecond results across these distant regions can be local SYN
+    # interception (e.g. a transparent proxy), not the intended mainland path.
+    ((RTT_MS >= 2)) || die '跨地区参考 RTT 不足 2 ms，可能测到了透明代理/TUN 入口或异常测点。未采用该结果，请直连重试或选择区域参考值。'
+    RTT_SOURCE="cn-tcp-p75-${successful}of9-sites"
+    log "大陆参考 RTT=$RTT_MS ms（各测点中位数的 P75，向上取整；$failed 个测点样本不足）。"
+    log '这是公开测点的 TCP 往返时间，不能代表每个用户或单独回程时延。'
+}
+
 fetch_https() {
     local url=$1 destination=$2
     if command -v curl >/dev/null; then
@@ -253,7 +346,10 @@ ensure_json_parser() {
 
 prepare_isolated_speedtest() {
     ensure_tmp
-    local arch digest runtime_home entry
+    local arch digest runtime_home required
+    for required in unshare mount setpriv timeout; do
+        command -v "$required" >/dev/null || die "临时测速环境需要 Debian 基础工具 $required；也可选择手动带宽或 JSON。"
+    done
     case $(uname -m) in
         x86_64) arch=x86_64; digest=5690596c54ff9bed63fa3732f818a05dbc2db19ad36ed68f21ca5f64d5cfeeb7 ;;
         aarch64) arch=aarch64; digest=3953d231da3783e2bf8904b6dd72767c5c6e533e163d3742fd0437affa431bd3 ;;
@@ -262,32 +358,44 @@ prepare_isolated_speedtest() {
     log '下载并校验 Ookla 1.2.0，建立一次性测速运行环境。'
     fetch_https "https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-$arch.tgz" "$TMP/ookla.tgz"
     verify_download "$TMP/ookla.tgz" "$digest"
-    SPEEDTEST_ROOT=$TMP/speedtest-root
+    SPEEDTEST_ROOT=$TMP/speedtest-home
     mkdir -p "$SPEEDTEST_ROOT"
     tar --no-same-owner --no-same-permissions -xzf "$TMP/ookla.tgz" -C "$SPEEDTEST_ROOT" speedtest
     [[ -f $SPEEDTEST_ROOT/speedtest && ! -L $SPEEDTEST_ROOT/speedtest ]] || die 'Unexpected Speedtest archive entry'
-    chmod 755 "$SPEEDTEST_ROOT" "$SPEEDTEST_ROOT/speedtest"
-    # Ookla 1.2.0 uses HOME and does not honor XDG_CONFIG_HOME. Keep the caller's
-    # environment unchanged; the same absolute home path exists only inside
-    # the disposable chroot. Run as numeric nobody UID/GID after chroot.
+    chmod 755 "$SPEEDTEST_ROOT/speedtest"
+    # Keep normal /proc, /sys, /dev and system libraries available. A private
+    # mount namespace overlays only the home and temporary directories; the
+    # caller's environment/home files and host mount table remain unchanged.
+    # Unlike a minimal chroot, this retains the OS interfaces used by the CLI.
     runtime_home=${HOME:-}
-    [[ $runtime_home == /* && $runtime_home != *'/../'* && $runtime_home != */.. && $runtime_home != *$'\n'* ]] || die 'Unsupported home path for the isolated runtime'
-    mkdir -p "$SPEEDTEST_ROOT$runtime_home" "$SPEEDTEST_ROOT/etc/ssl/certs" "$SPEEDTEST_ROOT/dev" "$SPEEDTEST_ROOT/tmp"
-    chown 65534:65534 "$SPEEDTEST_ROOT$runtime_home"
-    chmod 700 "$SPEEDTEST_ROOT$runtime_home"
-    chmod 1777 "$SPEEDTEST_ROOT/tmp"
-    for entry in /etc/resolv.conf /etc/hosts /etc/nsswitch.conf /etc/ssl/certs/ca-certificates.crt; do
-        if [[ -f $entry ]]; then
-            cp -L -- "$entry" "$SPEEDTEST_ROOT$entry"
-            chmod 644 "$SPEEDTEST_ROOT$entry"
-        fi
-    done
-    [[ -s $SPEEDTEST_ROOT/etc/ssl/certs/ca-certificates.crt ]] || die 'Existing system CA certificates are required; no packages were installed'
-    mknod -m 666 "$SPEEDTEST_ROOT/dev/null" c 1 3
-    mknod -m 666 "$SPEEDTEST_ROOT/dev/urandom" c 1 9
-    SPEEDTEST_CMD=(chroot --userspec=65534:65534 --groups=65534 "$SPEEDTEST_ROOT" /speedtest)
+    [[ $runtime_home == /* && -d $runtime_home && ! -L $runtime_home && $runtime_home != *'/../'* && $runtime_home != */.. && $runtime_home != *$'\n'* ]] || die 'Unsupported home path for the isolated runtime'
+    case $runtime_home in /|/tmp|/tmp/*|/var/tmp|/var/tmp/*|/proc|/sys|/dev|/etc|/usr|/run) die 'Unsafe home path for an isolated runtime' ;; esac
+    [[ -s /etc/ssl/certs/ca-certificates.crt ]] || die 'Existing system CA certificates are required; no packages were installed'
+    chown 65534:65534 "$SPEEDTEST_ROOT"
+    chmod 700 "$SPEEDTEST_ROOT"
+    cat > "$TMP/run-speedtest" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+ulimit -c 0
+private_home=$1
+original_home=$2
+shift 2
+mount --bind "$private_home" "$original_home"
+# These mounts exist only in this child namespace and vanish on exit.
+mount -t tmpfs -o nosuid,nodev,noexec,size=32m tmpfs /tmp
+if [[ -d /var/tmp && ! -L /var/tmp ]]; then
+    mount -t tmpfs -o nosuid,nodev,noexec,size=16m tmpfs /var/tmp
+fi
+cd "$original_home"
+exec setpriv --reuid=65534 --regid=65534 --clear-groups --no-new-privs \
+    "$original_home/speedtest" "$@"
+EOF
+    SPEEDTEST_CMD=(unshare --mount --propagation private -- bash "$TMP/run-speedtest" "$SPEEDTEST_ROOT" "$runtime_home")
     local version
-    version=$(timeout 10 "${SPEEDTEST_CMD[@]}" --version 2>&1) || die '临时测速环境无法运行；可改用手动带宽或 JSON。'
+    if ! version=$(timeout 10 "${SPEEDTEST_CMD[@]}" --version 2>&1); then
+        warn "$version"
+        die '临时隔离环境无法启动；需要 mount namespace 权限。未回退到系统安装，可选手动带宽或 JSON。'
+    fi
     [[ $version == *'Speedtest by Ookla 1.2.0'* ]] || die 'Unexpected isolated Speedtest version'
 }
 
@@ -297,10 +405,18 @@ resolve_bandwidth() {
     ensure_json_parser
     if ((SPEEDTEST)); then
         prepare_isolated_speedtest
-        log 'Running one official Ookla test (180s limit). Its ping is NOT used as business-path RTT'
-        if ! timeout --kill-after=5 180 "${SPEEDTEST_CMD[@]}" --accept-license --accept-gdpr --ca-certificate=/etc/ssl/certs/ca-certificates.crt --format=json > "$TMP/speedtest.json" 2> "$TMP/speedtest-error.log"; then
-            warn "$(tail -n 5 "$TMP/speedtest-error.log")"
-            die 'Speedtest failed/timed out; retry with known --bandwidth-mbps or valid --speedtest-json'
+        log '开始 Ookla 测速（最多 180 秒）；测速服务器的 ping 不作为大陆 RTT。'
+        local speedtest_status=0
+        { timeout --kill-after=5 180 "${SPEEDTEST_CMD[@]}" --accept-license --accept-gdpr --ca-certificate=/etc/ssl/certs/ca-certificates.crt --progress=no --format=json > "$TMP/speedtest.json"; } 2> "$TMP/speedtest-error.log" || speedtest_status=$?
+        if ((speedtest_status != 0)); then
+            warn "Ookla 退出码=$speedtest_status；系统=$(uname -srmo)；MemAvailable=$(awk '/MemAvailable:/ {print $2 " kB"}' /proc/meminfo)"
+            if [[ -s $TMP/speedtest-error.log ]]; then warn "$(tail -n 10 "$TMP/speedtest-error.log")"
+            else warn '测速程序未输出错误详情。'; fi
+            case $speedtest_status in
+                124|137) warn '测速超时或进程被终止；请检查网络连通性与内存。' ;;
+                134|139) warn '测速程序异常中止；这不是成功的测速结果，未写入调优配置。' ;;
+            esac
+            die '测速失败；临时环境将清理。可稍后重试，或选择手动带宽/已有 JSON。'
         fi
         parse_speedtest_json "$TMP/speedtest.json"
         BANDWIDTH_SOURCE=ookla-live
@@ -587,9 +703,9 @@ EOF
 
 buffer_plan_description() {
     if ((SMART)); then
-        local basis=manual
+        local basis=${RTT_SOURCE:-manual}
         case $SMART_PROFILE in
-            *-bdp) basis=region-planning-not-measured ;;
+            *-bdp) basis='region-planning-not-measured' ;;
             asia|overseas) basis=not-used ;;
         esac
         printf 'smart/%s; source=%s; upload/target=%s Mbit/s; download=%s Mbit/s; RTT=%s ms; RTT-basis=%s; BDP=%s MiB; wanted=%s MiB; RAM-cap=%s MiB; selected=%s MiB' \
@@ -807,12 +923,15 @@ menu_smart() {
     menu_base_args
     MENU_ARGS+=(--kernel skip --smart-bandwidth)
     printf '\n智能带宽调优（保留当前内核）\n'
-    printf '按节点所在区域选择。参考 RTT 用于多用户容量规划，并非实测平均延迟。\n'
-    printf '1. 亚太节点（参考 RTT 100 ms）\n2. 欧美节点（参考 RTT 200 ms）\n3. 高级：自定义 RTT / 原项目经验表\n0. 返回\n'
-    menu_read '选择节点区域 [1]：' 1 || return 0
+    printf '自动探测大陆公开测点，或按节点区域选规划值。\n'
+    printf '1. 亚太节点（参考 RTT 100 ms）\n2. 欧美节点（参考 RTT 200 ms）\n3. 高级：自定义 RTT / 原项目经验表\n4. 自动探测大陆三网 RTT（推荐）\n0. 返回\n'
+    menu_read '选择 RTT 方案 [4]：' 4 || return 0
     case $REPLY in
         1) MENU_ARGS+=(--smart-profile asia-bdp) ;;
         2) MENU_ARGS+=(--smart-profile overseas-bdp) ;;
+        4)
+            if ((TEST)) || is_container; then printf '容器测试不发起公网 RTT 探测，请选择区域参考值或手动 RTT。\n'; return 0; fi
+            MENU_ARGS+=(--smart-profile bdp --auto-rtt) ;;
         3)
             printf '1. 自定义代表性 RTT（BDP）\n2. 原项目亚太带宽表（不用 RTT）\n3. 原项目欧美带宽表（不用 RTT）\n0. 返回\n'
             menu_read '请选择 [1]：' 1 || return 0
@@ -930,6 +1049,7 @@ main() {
         exec 9>/run/lock/vps-tune.lock
         flock -n 9 || die 'Another vps-tune is running'
     fi
+    resolve_rtt
     resolve_bandwidth
     choose_plan
     log "Plan: Debian $VERSION_ID ($CODENAME), kernel=${PACKAGE:-skip}, network=BBR+CAKE, nofile=$NOFILE, RAM=${MEM_MIB}MiB, buffer ceiling=${BUFFER}MiB"
