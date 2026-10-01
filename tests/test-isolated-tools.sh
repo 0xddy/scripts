@@ -126,6 +126,22 @@ test_partial_package_keeps_host_version() {
     assert_eq "$(cat "$BUILD_LOG")" iproute2
 }
 
+test_migration_keeps_json_parser_for_rollback() {
+    setup_tools
+    drop_tools jq
+    TCPFIT_MIGRATE=1
+    prepare_scan_tools
+    assert_eq "$PERSIST_SCAN_TOOLS" 1
+    init_state
+    persist_scan_tools
+    local retained=$SCAN_TOOLS_ROOT
+    cleanup
+    [[ -d $retained && ! -e $TMP ]]
+    PATH="$HOST_BIN:$SUPPORT_BIN"
+    activate_persistent_tools
+    assert_eq "$(jq)" 'private-fixture jq'
+}
+
 test_queue_dependencies_persist_flag() {
     local missing
     for missing in ip tc sysctl modprobe modinfo; do
@@ -435,6 +451,7 @@ case_run() {
 case_run 'Complete host dependencies are reused without downloads or writes' test_complete_reuses_host
 case_run 'Measurement-only dependencies stay temporary and are cleaned up' test_measurement_tools_temporary
 case_run 'A partial package never shadows an existing host command' test_partial_package_keeps_host_version
+case_run 'Explicit migration retains missing jq for a later full rollback' test_migration_keeps_json_parser_for_rollback
 case_run 'Queue/runtime dependencies request persistent retention' test_queue_dependencies_persist_flag
 case_run 'Dry-run does not download, install, create paths or change PATH' test_dry_run_no_changes
 case_run 'A failed isolated build cannot write persistent state' test_failed_build_no_state
