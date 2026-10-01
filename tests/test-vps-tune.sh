@@ -26,6 +26,7 @@ assert_eq() {
 case_run() {
     local name=$1
     shift
+    [[ -z ${TEST_FILTER:-} || $name == *"$TEST_FILTER"* ]] || return 0
     if (set -e; "$@") >"$HARNESS_TMP/case.log" 2>&1; then
         printf 'PASS %s\n' "$name"
         passed=$((passed+1))
@@ -34,6 +35,149 @@ case_run() {
         cat "$HARNESS_TMP/case.log"
         failed=$((failed+1))
     fi
+}
+
+test_write_idempotence() {
+    load_script
+    local sandbox="$HARNESS_TMP/write-idempotence" identity attempt
+    mkdir -p "$sandbox"
+    STATE="$sandbox/state"; SYSCTL="$sandbox/tuned.conf"
+    printf 'net.core.rmem_max = 4194304\n' > "$SYSCTL"
+    cp "$SYSCTL" "$sandbox/original"
+    identity=$(stat -c '%i:%y' "$SYSCTL")
+    init_state
+    # The very first write must register an identical pre-existing file without
+    # replacing its inode, and must retain a snapshot for future rollback.
+    for attempt in 1 2 3; do
+        write_file "$SYSCTL" < "$sandbox/original" || return
+        assert_eq "$(stat -c '%i:%y' "$SYSCTL")" "$identity" || return
+        cmp "$sandbox/original" "$SYSCTL" || return
+        cmp "$sandbox/original" "$STATE/original$SYSCTL" || return
+        cmp "$sandbox/original" "$STATE/expected$SYSCTL" || return
+        assert_eq "$(wc -l < "$STATE/manifest")" 1 || return
+    done
+    printf 'net.core.rmem_max = 8388608\n' | write_file "$SYSCTL" || return
+    assert_eq "$(cat "$SYSCTL")" 'net.core.rmem_max = 8388608' || return
+    cmp "$sandbox/original" "$STATE/original$SYSCTL" || return
+    identity=$(stat -c '%i:%y' "$SYSCTL")
+    for attempt in 1 2 3; do
+        printf 'net.core.rmem_max = 8388608\n' | write_file "$SYSCTL" || return
+        assert_eq "$(stat -c '%i:%y' "$SYSCTL")" "$identity" || return
+    done
+    # An identical desired result is still an external edit if it differs from
+    # the last managed contents: skipping a write must never bypass that guard.
+    printf 'net.core.rmem_max = 16777216\n' > "$SYSCTL"
+    cp "$SYSCTL" "$sandbox/external"
+    if (write_file "$SYSCTL" < "$sandbox/external"); then
+        printf 'Identical desired contents bypassed external-edit protection\n' >&2
+        return 1
+    fi
+    cmp "$sandbox/external" "$SYSCTL" || return
+    cmp "$sandbox/original" "$STATE/original$SYSCTL"
+}
+
+test_duplicate_sysctls() {
+    load_script
+    local sandbox="$HARNESS_TMP/duplicate-sysctls" variant
+    mkdir -p "$sandbox"
+    STATE="$sandbox/state"; SYSCTL="$sandbox/tuned.conf"
+    init_state
+    printf '# Existing managed value\nnet.core.rmem_max = 4194304\n' | write_file "$SYSCTL" || return
+    cp "$SYSCTL" "$sandbox/before"
+    cp "$STATE/manifest" "$sandbox/manifest-before"
+    # Optional '-' prefixes, whitespace and / notation identify the same key.
+    for variant in 'net.core.rmem_max' '-net.core.rmem_max' 'net/core/rmem_max' '-net/core/rmem_max'; do
+        if (printf 'net.core.rmem_max = 4194304\n\t%s\t= 8388608\n' "$variant" | write_file "$SYSCTL"); then
+            printf 'Accepted duplicate sysctl key: %s\n' "$variant" >&2
+            return 1
+        fi
+        cmp "$sandbox/before" "$SYSCTL" || return
+        cmp "$sandbox/before" "$STATE/expected$SYSCTL" || return
+        cmp "$sandbox/manifest-before" "$STATE/manifest" || return
+    done
+    # A failed first write must not acquire or snapshot an unrelated file.
+    SYSCTL="$sandbox/never-managed.conf"
+    printf 'original user configuration\n' > "$SYSCTL"
+    if (printf 'net.core.wmem_max = 1\n-net/core/wmem_max = 2\n' | write_file "$SYSCTL"); then return 1; fi
+    assert_eq "$(cat "$SYSCTL")" 'original user configuration' || return
+    [[ ! -e $STATE/original$SYSCTL && ! -e $STATE/expected$SYSCTL ]] || return 1
+    cmp "$sandbox/manifest-before" "$STATE/manifest" || return
+    # Distinct valid keys and commented-out examples remain valid input.
+    printf '# net.core.rmem_max = old\n; net/core/rmem_max = old\n-net/core/rmem_max = 1\nnet.core.wmem_max = 2\n' |
+        write_file "$SYSCTL"
+}
+
+test_snapshot_key_exactness() {
+    load_script
+    STATE="$HARNESS_TMP/snapshot-key-exactness"
+    init_state
+    printf 'other.net.core.rmem_max=shadow\nnet.ipv4.test=net.core.wmem_max=shadow\n' > "$STATE/runtime.before"
+    sysctl() { [[ $1 == -n ]] || return 1; printf 'original-%s\n' "$2"; }
+    local key attempt
+    for attempt in 1 2 3; do
+        for key in net.core.rmem_max net.core.wmem_max; do save_runtime "$key" || return; done
+    done
+    assert_eq "$(wc -l < "$STATE/runtime.before")" 4 || return
+    grep -Fxq 'net.core.rmem_max=original-net.core.rmem_max' "$STATE/runtime.before" || return
+    grep -Fxq 'net.core.wmem_max=original-net.core.wmem_max' "$STATE/runtime.before" || return
+    # Later runtime values cannot replace the very first captured value.
+    sysctl() { printf 'modified\n'; }
+    for key in net.core.rmem_max net.core.wmem_max; do save_runtime "$key" || return; done
+    assert_eq "$(wc -l < "$STATE/runtime.before")" 4 || return
+    grep -Fxq 'net.core.rmem_max=original-net.core.rmem_max' "$STATE/runtime.before" || return
+    grep -Fxq 'net.core.wmem_max=original-net.core.wmem_max' "$STATE/runtime.before"
+}
+
+test_pam_module_detection() {
+    load_script
+    local fixture="$HARNESS_TMP/pam-module" line
+    for line in \
+        'session required pam_limits.so' \
+        '-session required pam_limits.so # valid optional type' \
+        'session [success=1 default=ignore] pam_limits.so' \
+        'session required /lib/security/pam_limits.so conf=/etc/security/limits.conf'; do
+        printf '%s\n' "$line" > "$fixture"
+        pam_limits_present "$fixture" || { printf 'Missed active PAM rule: %s\n' "$line" >&2; return 1; }
+    done
+    for line in \
+        '# session required pam_limits.so' \
+        'auth required pam_limits.so' \
+        'session required pam_unix.so # pam_limits.so' \
+        'session optional pam_exec.so /bin/echo pam_limits.so' \
+        'session required pam_limits.so.disabled'; do
+        printf '%s\n' "$line" > "$fixture"
+        if pam_limits_present "$fixture"; then printf 'False positive PAM rule: %s\n' "$line" >&2; return 1; fi
+    done
+}
+
+test_sysctl_separator_rules() {
+    load_script
+    local fixture="$HARNESS_TMP/sysctl-separators"
+    printf 'net.ipv4.conf.eth0/100.forwarding = 1\nnet/ipv4/conf/eth0.100/forwarding = 0\n' > "$fixture"
+    if validate_sysctl_file "$fixture"; then
+        printf 'Missed identical sysctl key with literal interface-name dot\n' >&2
+        return 1
+    fi
+    printf 'net.ipv4.conf.eth0/100.forwarding = 1\nnet.ipv4.conf.eth0.100.forwarding = 0\n' > "$fixture"
+    validate_sysctl_file "$fixture"
+}
+
+test_queue_duplicate_guard() {
+    load_script
+    STATE="$HARNESS_TMP/queue-duplicate/state"; SYSCTL="$HARNESS_TMP/queue-duplicate.conf"
+    printf 'net.core.rmem_max = 1\n-net/core/rmem_max = 2\n-net.core.default_qdisc = fq\n' > "$SYSCTL"
+    local sentinel="$HARNESS_TMP/queue-mutated"
+    cp "$SYSCTL" "$HARNESS_TMP/queue-before"
+    QDISC=cake
+    init_state() { touch "$sentinel"; return 1; }
+    track_file() { touch "$sentinel"; return 1; }
+    write_file() { touch "$sentinel"; return 1; }
+    modprobe() { touch "$sentinel"; return 1; }
+    tc() { touch "$sentinel"; return 1; }
+    sysctl() { touch "$sentinel"; return 1; }
+    if (switch_queue); then printf 'Queue switch accepted duplicate sysctls\n' >&2; return 1; fi
+    [[ ! -e $sentinel && ! -d $STATE ]] || return 1
+    cmp "$SYSCTL" "$HARNESS_TMP/queue-before"
 }
 
 test_memory() {
@@ -357,6 +501,12 @@ test_snapshot_rollback() {
 }
 
 case_run 'Bash syntax' bash -n "$SCRIPT"
+case_run 'Idempotency: unchanged writes preserve identity and first snapshots' test_write_idempotence
+case_run 'Idempotency: duplicate normalized sysctl keys fail before mutation' test_duplicate_sysctls
+case_run 'Idempotency: runtime snapshots match exact keys and preserve first values' test_snapshot_key_exactness
+case_run 'Idempotency: PAM module detection respects comments and valid controls' test_pam_module_detection
+case_run 'Idempotency: sysctl separator rules preserve literal interface-name dots' test_sysctl_separator_rules
+case_run 'Idempotency: queue duplicates fail before live changes or snapshots' test_queue_duplicate_guard
 case_run 'TCP budget: exact page-size and memory boundaries' test_memory
 case_run 'BDP: examples, rounding boundaries, monotonicity, legacy profiles' test_bdp
 case_run 'CLI accepts existing forms and rejects invalid/conflicting inputs' test_args
