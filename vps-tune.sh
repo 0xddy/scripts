@@ -728,16 +728,73 @@ track_file() {
     printf '%s\n' "$path" >> "$STATE/manifest"
 }
 
-write_file() {
-    local path=$1 tmpfile
-    track_file "$path"
-    mkdir -p "$(dirname "$path")" "$STATE/expected$(dirname "$path")"
+validate_sysctl_file() {
+    # Follow sysctl.d's separator rules, including literal dots in interface
+    # names. A leading '-' only makes an assignment optional, not a new key.
+    awk '
+        function canonical(key, result, i, character) {
+            sub(/^-/, "", key);
+            if (match(key, /[.\/]/) && substr(key, RSTART, 1)==".") {
+                for(i=1;i<=length(key);i++) {
+                    character=substr(key,i,1);
+                    result=result (character=="." ? "/" : character=="/" ? "." : character);
+                }
+                return result;
+            }
+            return key;
+        }
+        /^[[:space:]]*([#;]|$)/ {next}
+        index($0,"=") {
+            key=substr($0,1,index($0,"=")-1);
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", key);
+            key=canonical(key);
+            if(key in seen) {
+                printf "[ERROR] Duplicate sysctl key %s (lines %d and %d)\n", key, seen[key], FNR > "/dev/stderr";
+                failed=1;
+            } else seen[key]=FNR;
+        }
+        END {exit failed ? 1 : 0}' "${1:-/dev/stdin}"
+}
+
+write_file() (
+    # Stage before tracking/committing so invalid generated content cannot
+    # enter either the live file or the backup manifest. The subshell confines
+    # the temporary-file cleanup trap to this single write.
+    local path=$1 tmpfile=''
+    trap '[[ -z $tmpfile ]] || rm -f -- "$tmpfile"' EXIT
+    mkdir -p "$(dirname "$path")"
     tmpfile=$(mktemp "$(dirname "$path")/.vps-tune.XXXXXX")
     cat > "$tmpfile"
-    chmod 644 "$tmpfile"
-    mv -f -- "$tmpfile" "$path"
-    cp -- "$path" "$STATE/expected$path"
+    if [[ $path == "$SYSCTL" ]]; then
+        validate_sysctl_file "$tmpfile" || die 'Refusing duplicate generated sysctl assignments; configuration was not replaced'
+    fi
+    # Check for outside edits even when the requested bytes are unchanged.
+    track_file "$path"
+    mkdir -p "$STATE/expected$(dirname "$path")"
+    if [[ ! -f $path ]] || ! cmp -s "$tmpfile" "$path"; then
+        chmod 644 "$tmpfile"
+        mv -f -- "$tmpfile" "$path"
+    fi
+    if [[ ! -f $STATE/expected$path ]] || ! cmp -s "$path" "$STATE/expected$path"; then
+        cp -- "$path" "$STATE/expected$path"
+    fi
     rm -f -- "$STATE/expected-absent$path"
+)
+
+pam_limits_present() {
+    # Parse the module position, not comments or module arguments. PAM also
+    # accepts -session and bracketed controls containing spaces.
+    awk '
+        {
+            sub(/#.*/, ""); sub(/^[[:space:]]+/, "");
+            if($0 !~ /^-?session[[:space:]]/) next;
+            sub(/^-?session[[:space:]]+/, "");
+            if($0 ~ /^\[/) sub(/^\[[^]]*\][[:space:]]+/, "");
+            else sub(/^[^[:space:]]+[[:space:]]+/, "");
+            split($0,fields,/[[:space:]]+/);
+            if(fields[1] ~ /(^|\/)pam_limits\.so$/) found=1;
+        }
+        END {exit found ? 0 : 1}' "$1"
 }
 
 apt_update() { apt-get -o Acquire::Retries=3 -o APT::Update::Error-Mode=any update; }
@@ -840,7 +897,10 @@ EOF
     local path
     for path in /etc/pam.d/common-session /etc/pam.d/common-session-noninteractive; do
         [[ -f $path ]] || die "Missing PAM stack: $path"
-        if ! grep -Eq '^[[:space:]]*session[[:space:]].*pam_limits\.so([[:space:]]|$)' "$path"; then
+        # A previously tracked PAM file still needs its conflict check even
+        # when its pam_limits entry already exists and no write is necessary.
+        if grep -Fxq "$path" "$STATE/manifest"; then track_file "$path"; fi
+        if ! pam_limits_present "$path"; then
             local content
             content=$(cat "$path")
             printf '%s\nsession required pam_limits.so # vps-tune\n' "$content" | write_file "$path"
@@ -1017,7 +1077,7 @@ show_completion() {
 
 save_runtime() {
     local key=$1 value
-    grep -qF "$key=" "$STATE/runtime.before" && return 0
+    if awk -F= -v wanted="$key" '$1==wanted {found=1} END {exit found ? 0 : 1}' "$STATE/runtime.before"; then return 0; fi
     if value=$(sysctl -n "$key" 2>/dev/null); then
         printf '%s=%s\n' "$key" "$value" >> "$STATE/runtime.before"
     fi
@@ -1050,8 +1110,8 @@ apply_runtime() {
     systemctl daemon-reexec
 }
 
-persist_queue_choice() {
-    local content modules=/etc/modules-load.d/$TAG
+queue_sysctl_content() {
+    local content
     if [[ -f $SYSCTL ]]; then content=$(cat "$SYSCTL")
     else content='# Managed by vps-tune.'; fi
     awk -v target="$QDISC" '
@@ -1060,7 +1120,12 @@ persist_queue_choice() {
             written=1; next
         }
         {print}
-        END {if(!written) print "-net.core.default_qdisc = " target}' <<< "$content" | write_file "$SYSCTL"
+        END {if(!written) print "-net.core.default_qdisc = " target}' <<< "$content"
+}
+
+persist_queue_choice() {
+    local content modules=/etc/modules-load.d/$TAG
+    queue_sysctl_content | write_file "$SYSCTL"
     content=
     [[ ! -f $modules ]] || content=$(cat "$modules")
     awk -v target="$QDISC" '
@@ -1074,6 +1139,8 @@ switch_queue() {
     local -a interfaces=() change_interfaces=() change_parents=()
     local -A snapshots=()
     print_heading "切换队列：${QDISC^^}"
+    # Validate the proposed persistent file BEFORE touching any live qdisc.
+    queue_sysctl_content | validate_sysctl_file || die 'Resolve duplicate sysctl assignments before switching queues'
     if ((TEST == 0)); then
         for required in ip tc sysctl modprobe; do
             command -v "$required" >/dev/null || die "缺少 $required，请先执行常规调优安装基础工具。"
@@ -1210,6 +1277,7 @@ check_status() {
         if [[ $(uname -r) != "$kernel_target" ]]; then warn 'The selected XanMod version is not running; reboot/boot verification still required'; bad=1; fi
     fi
     [[ -f $SYSCTL ]] || { warn 'No tuning configuration'; return 2; }
+    validate_sysctl_file "$SYSCTL" || bad=1
     grep '^# Buffer plan:' "$SYSCTL" || true
     while IFS= read -r line; do
         [[ $line == *=* && $line != \#* ]] || continue
