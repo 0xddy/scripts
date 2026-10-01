@@ -55,6 +55,13 @@ SHAPE_OFF=0
 SWEEP_PEER=
 SWEEP_NOMINAL=
 ACCEPT_TRAFFIC=0
+SMART_SWEEP=0
+APPLY_SUGGESTED_SHAPE=0
+SMART_SWEEP_IFACE=
+SMART_SWEEP_REUSE_QUEUE=0
+SMART_SWEEP_RESULT_FILE=
+SMART_BASE_APPLIED=0
+TUNE_LOCK_HELD=0
 
 ui_text() {
     local tone=$1 value=$2 code=
@@ -118,7 +125,12 @@ cleanup() { stop_spinner; [[ -z $TMP ]] || rm -rf -- "$TMP"; }
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
-on_error() { local rc=$1 line=$2; ui_text error "[ERROR] line $line, exit $rc. Inspect output; backup: $STATE" >&2; printf '\n' >&2; exit "$rc"; }
+on_error() {
+    local rc=$1 line=$2
+    ui_text error "[ERROR] line $line, exit $rc. Inspect output; backup: $STATE" >&2; printf '\n' >&2
+    if ((SMART_BASE_APPLIED)); then warn '基础调优已写入；请检查上方队列恢复结果，也可使用 rollback 回滚。'; fi
+    exit "$rc"
+}
 trap 'on_error "$?" "$LINENO"' ERR
 
 usage() {
@@ -133,14 +145,19 @@ Usage: bash vps-tune.sh                    # Chinese interactive menu
   --nofile NUMBER          Global soft/hard limit; 65536..1048576.
   --buffer-mib auto|NUMBER Per-direction ceiling, 4..256 MiB, within RAM budget.
   --smart-bandwidth        Opt in to bandwidth-aware buffers (default: BDP).
-  --smart-profile bdp|asia-bdp|overseas-bdp|asia|overseas
-                          Region BDP: planning RTT 100/200ms. asia/overseas: tables.
+  --smart-profile tcpfit-bdp|bdp|asia-bdp|overseas-bdp|asia|overseas
+                          tcpfit: planning RTT 150ms; region BDP: 100/200ms.
+                          asia/overseas retain legacy bandwidth tables.
   --bandwidth-mbps NUMBER  Target bottleneck/egress bandwidth, decimal Mbit/s.
   --rtt-ms NUMBER          Representative TCP RTT; alternative to --auto-rtt.
   --auto-rtt               Probe mainland TCP RTT; use P75 of valid site medians.
   --speedtest-json FILE    Import an existing Ookla JSON result (bytes/sec).
   --speedtest              Run a temporary isolated official Ookla CLI once.
   --accept-speedtest-terms Explicitly accept Ookla license/GDPR for this run.
+  --smart-sweep           With smart apply + --kernel skip: prepare fq, scan
+                          --peer HOST, and reuse the resolved bandwidth.
+                          Requires --accept-traffic unless --dry-run.
+  --apply-suggested-shape With --smart-sweep: apply only a validated suggestion.
   shape --rate-mbps NUMBER Apply an aggregate egress cap with HTB + fq.
   shape --off             Remove owned shaping; keep base tuning and fq.
   sweep --peer HOST --nominal-mbps NUMBER --accept-traffic
@@ -190,6 +207,8 @@ parse_args() {
             --allow-dkms) ALLOW_DKMS=1; shift ;;
             --review) REVIEW=1; shift ;;
             --smart-bandwidth) SMART=1; shift ;;
+            --smart-sweep) SMART_SWEEP=1; shift ;;
+            --apply-suggested-shape) APPLY_SUGGESTED_SHAPE=1; shift ;;
             --auto-rtt) RTT_AUTO=1; shift ;;
             --speedtest) SPEEDTEST=1; shift ;;
             --accept-speedtest-terms) ACCEPT_SPEEDTEST=1; shift ;;
@@ -229,7 +248,7 @@ valid_positive() {
 }
 
 validate_smart_args() {
-    [[ $SMART_PROFILE =~ ^(bdp|asia-bdp|overseas-bdp|asia|overseas)$ ]] || die 'Invalid --smart-profile'
+    [[ $SMART_PROFILE =~ ^(tcpfit-bdp|bdp|asia-bdp|overseas-bdp|asia|overseas)$ ]] || die 'Invalid --smart-profile'
     if ((SMART == 0)); then
         if [[ -n $BANDWIDTH || -n $RTT_MS || -n $SPEEDTEST_JSON || $SMART_PROFILE != bdp ]] || ((SPEEDTEST || ACCEPT_SPEEDTEST || RTT_AUTO)); then
             die 'Bandwidth options require --smart-bandwidth'
@@ -242,9 +261,10 @@ validate_smart_args() {
         ((TEST == 0 && DRY == 0)) || die 'RTT probing is disabled in dry-run/container-test; use manual RTT or a region profile'
     fi
     case $SMART_PROFILE in
-        asia-bdp|overseas-bdp)
+        tcpfit-bdp|asia-bdp|overseas-bdp)
             [[ -z $RTT_MS ]] || die 'Region BDP supplies a planning RTT; use profile bdp for a custom RTT'
             RTT_MS=100
+            [[ $SMART_PROFILE != tcpfit-bdp ]] || RTT_MS=150
             [[ $SMART_PROFILE != overseas-bdp ]] || RTT_MS=200 ;;
     esac
     [[ $BUFFER == auto ]] || die 'Choose --smart-bandwidth OR a manual --buffer-mib'
@@ -294,7 +314,7 @@ smart_buffer_plan() {
     awk -v bw="$bandwidth" -v rtt="$rtt" -v mode="$profile" -v cap="$cap" '
     BEGIN {
         bdp=bw*1000000/8*rtt/1000/1048576;
-        if (mode=="bdp" || mode=="asia-bdp" || mode=="overseas-bdp") {
+        if (mode=="bdp" || mode=="tcpfit-bdp" || mode=="asia-bdp" || mode=="overseas-bdp") {
             target=2*bdp+2;
             wanted=int(target); if(wanted<target) wanted++;
             if(wanted<4) wanted=4;
@@ -969,6 +989,7 @@ buffer_plan_description() {
     if ((SMART)); then
         local basis=${RTT_SOURCE:-manual}
         case $SMART_PROFILE in
+            tcpfit-bdp) basis='tcpfit-planning-not-measured' ;;
             *-bdp) basis='region-planning-not-measured' ;;
             asia|overseas) basis=not-used ;;
         esac
@@ -990,6 +1011,7 @@ show_tuning_plan() {
     if ((SMART)); then
         local basis='手动填写' profile='带宽与 RTT 计算'
         case $SMART_PROFILE in
+            tcpfit-bdp) basis='tcpfit 规划值（非实测）' ;;
             asia-bdp) basis='亚太区域规划值' ;;
             overseas-bdp) basis='欧美区域规划值' ;;
             asia) profile='亚太带宽经验表' ;;
@@ -1009,6 +1031,7 @@ show_tuning_plan() {
             printf '  选择方式  使用自动建议\n'
         fi
     fi
+    show_smart_sweep_plan
 }
 
 show_buffer_notice() {
@@ -1070,8 +1093,13 @@ show_completion() {
     if [[ $KERNEL != skip ]]; then
         printf '  XanMod：内核已安装/更新，重启后请确认已切换到目标版本。\n'
     fi
-    printf '  BBR + %s：已写入开机配置，实际网卡队列需重启后检查。\n' "${QDISC^^}"
-    printf '\n  下一步：方便时手动重启，重新连接后选择菜单 5 检查生效状态。\n'
+    if ((SMART_SWEEP)); then
+        printf '  智能调优：基础参数和实际出口队列已应用，扫描结果及整形状态见上方。\n'
+        printf '\n  下一步：重新登录或重启业务服务以采用新句柄限制；菜单 5 可检查状态。\n'
+    else
+        printf '  BBR + %s：已写入开机配置，实际网卡队列需重启后检查。\n' "${QDISC^^}"
+        printf '\n  下一步：方便时手动重启，重新连接后选择菜单 5 检查生效状态。\n'
+    fi
     printf '  原配置已备份，可通过菜单 6 回滚。\n'
 }
 
@@ -1410,9 +1438,10 @@ menu_intro() {
             printf '按本机内存设置缓冲上限。\n' ;;
         3)
             print_heading '智能带宽调优'
-            printf '保留当前内核，按带宽和参考 RTT 计算缓冲上限，并配置文件句柄及网络参数。\n'
-            printf '支持手动带宽、测速和 JSON 导入；测速会消耗公网流量。\n'
-            printf '计算后可保留自动建议，或手动指定缓冲上限。\n' ;;
+            printf '保留当前内核，整合 tcpfit 的 BDP/内存预算、BBR + FQ 及可选拐点扫描。\n'
+            printf '同一流程内可完成复测和应用整形；基础模式保留已有队列选择。\n'
+            printf '完整模式设置 FQ：选择扫描时立即切换，跳过扫描时重启后生效。\n'
+            printf '所有方案先审阅再执行，真实扫描需单独同意流量使用。\n' ;;
     esac
     menu_read '输入 y 确认继续，回车返回 [y/N]：' n || return 1
     [[ $REPLY == y || $REPLY == Y ]]
@@ -1512,30 +1541,71 @@ menu_settings() {
 }
 
 menu_smart() {
+    local mode rtt_default peer='' scan=0 automatic=0
     menu_base_args
     MENU_ARGS+=(--kernel skip --smart-bandwidth)
-    printf '\n智能带宽调优（保留当前内核）\n'
-    printf '自动探测大陆公开测点，或按节点区域选规划值。\n'
-    printf '1. 亚太节点（参考 RTT 100 ms）\n2. 欧美节点（参考 RTT 200 ms）\n3. 高级：自定义 RTT / 原项目经验表\n4. 自动探测大陆三网 RTT（推荐）\n0. 返回\n'
-    menu_read '选择 RTT 方案 [4]：' 4 || return 0
+    ((DRY == 0)) || MENU_ARGS+=(--dry-run)
+    print_heading '智能带宽调优（保留当前内核）'
+    printf '1. 完整智能调优：BDP + BBR/FQ，可选 iperf3 拐点扫描与验证\n'
+    printf '2. 仅基础调优：按带宽计算缓冲，保留当前队列选择\n'
+    printf '3. 高级：扫描、手动整形与关闭整形\n0. 返回\n'
+    if ((TEST)) || is_container; then
+        printf '容器仅支持基础调优，不运行公网测量或修改真实队列。\n'
+        menu_read '请选择 [2]：' 2 || return 0
+    else
+        menu_read '请选择 [1]：' 1 || return 0
+    fi
+    mode=$REPLY
+    case $mode in
+        1)
+            if ((TEST)) || is_container; then
+                printf '容器请使用选项 2 进行基础调优。\n'; return 0
+            fi
+            MENU_ARGS+=(--qdisc fq)
+            rtt_default=5 ;;
+        2)
+            rtt_default=4
+            if ((TEST)) || is_container; then rtt_default=5; fi ;;
+        3)
+            if ((DRY)); then printf '预览模式请使用完整智能调优查看扫描计划；高级整形管理需退出预览模式后进入。\n'; return 0; fi
+            menu_shape; return 0 ;;
+        0) return 0 ;;
+        *) printf '无效选择，返回菜单。\n'; return 0 ;;
+    esac
+    printf '\n按出口/瓶颈带宽和参考 RTT 计算缓冲，并受本机内存预算限制。\n'
+    printf '1. 亚太节点（参考 RTT 100 ms）\n2. 欧美节点（参考 RTT 200 ms）\n'
+    if [[ $mode == 1 ]]; then
+        printf '3. 自定义代表性 RTT（BDP）\n'
+    else
+        printf '3. 高级：自定义 RTT / 原项目经验表\n'
+    fi
+    printf '4. 自动探测大陆三网 RTT\n5. tcpfit 规划参考值（RTT 150 ms）\n0. 返回\n'
+    menu_read "选择 RTT 方案 [$rtt_default]：" "$rtt_default" || return 0
     case $REPLY in
         1) MENU_ARGS+=(--smart-profile asia-bdp) ;;
         2) MENU_ARGS+=(--smart-profile overseas-bdp) ;;
+        5) MENU_ARGS+=(--smart-profile tcpfit-bdp) ;;
         4)
             if ((TEST)) || is_container; then printf '容器测试不发起公网 RTT 探测，请选择区域参考值或手动 RTT。\n'; return 0; fi
             MENU_ARGS+=(--smart-profile bdp --auto-rtt) ;;
         3)
-            printf '1. 自定义代表性 RTT（BDP）\n2. 原项目亚太带宽表（不用 RTT）\n3. 原项目欧美带宽表（不用 RTT）\n0. 返回\n'
-            menu_read '请选择 [1]：' 1 || return 0
-            case $REPLY in
-                1)
-                    MENU_ARGS+=(--smart-profile bdp)
-                    menu_number '输入多地区代表性 TCP RTT（ms）：' 5000 || return 0
-                    MENU_ARGS+=(--rtt-ms "$REPLY") ;;
-                2) MENU_ARGS+=(--smart-profile asia) ;;
-                3) MENU_ARGS+=(--smart-profile overseas) ;;
-                *) return 0 ;;
-            esac ;;
+            if [[ $mode == 1 ]]; then
+                MENU_ARGS+=(--smart-profile bdp)
+                menu_number '输入多地区代表性 TCP RTT（ms）：' 5000 || return 0
+                MENU_ARGS+=(--rtt-ms "$REPLY")
+            else
+                printf '1. 自定义代表性 RTT（BDP）\n2. 原项目亚太带宽表（不用 RTT）\n3. 原项目欧美带宽表（不用 RTT）\n0. 返回\n'
+                menu_read '请选择 [1]：' 1 || return 0
+                case $REPLY in
+                    1)
+                        MENU_ARGS+=(--smart-profile bdp)
+                        menu_number '输入多地区代表性 TCP RTT（ms）：' 5000 || return 0
+                        MENU_ARGS+=(--rtt-ms "$REPLY") ;;
+                    2) MENU_ARGS+=(--smart-profile asia) ;;
+                    3) MENU_ARGS+=(--smart-profile overseas) ;;
+                    *) return 0 ;;
+                esac
+            fi ;;
         0) return 0 ;;
         *) printf '无效选择，返回菜单。\n'; return 0 ;;
     esac
@@ -1556,6 +1626,40 @@ menu_smart() {
         0) return 0 ;;
         *) printf '无效选择，返回菜单。\n'; return 0 ;;
     esac
+    if [[ $mode == 1 ]]; then
+        printf '\n可选 iperf3 拐点扫描：先测基准，再按需要扫描并复测建议速率。\n'
+        printf '扫描沿用以上带宽值，影响整张出口网卡，并消耗真实公网流量。\n'
+        printf '只接受你拥有或获准测试的 iperf3 对端；低重传或证据不足时不建议整形。\n'
+        menu_read '是否加入拐点扫描 [y/N]：' n || return 0
+        if [[ $REPLY == y || $REPLY == Y ]]; then
+            scan=1
+            menu_read 'iperf3 对端主机/IP（服务端口 5201）：' || return 0
+            peer=$REPLY
+            if [[ ! $peer =~ ^[a-zA-Z0-9][a-zA-Z0-9.:-]{0,252}$ ]]; then
+                printf '请输入有效主机名或 IP，不要包含端口、URL 或命令选项。\n'; return 0
+            fi
+            printf '只有建议通过实测验证才会自动应用；否则不应用新的整形速率。\n'
+            menu_read '自动应用验证通过的建议整形速率 [y/N]：' n || return 0
+            [[ $REPLY != y && $REPLY != Y ]] || automatic=1
+            if ((DRY)); then
+                printf '当前为预览模式：只展示计划，不测速、不安装依赖、不修改配置。\n'
+            else
+                printf '正式执行前还会显示完整方案和流量估算；未整形基准流量可能超过估算。\n'
+                menu_read '确认有权测试该对端，并接受扫描流量和临时队列切换 [y/N]：' n || return 0
+                if [[ $REPLY != y && $REPLY != Y ]]; then
+                    scan=0; automatic=0
+                    printf '已跳过扫描，将审阅基础 BDP + BBR/FQ 方案；实际网卡队列需重启后生效。\n'
+                fi
+            fi
+        else
+            printf '已跳过扫描，将审阅基础 BDP + BBR/FQ 方案；实际网卡队列需重启后生效。\n'
+        fi
+    fi
+    if ((scan)); then
+        MENU_ARGS+=(--smart-sweep --peer "$peer")
+        ((DRY)) || MENU_ARGS+=(--accept-traffic)
+        ((automatic == 0)) || MENU_ARGS+=(--apply-suggested-shape)
+    fi
     menu_run "${MENU_ARGS[@]}"
 }
 
@@ -1699,7 +1803,6 @@ interactive_menu() {
         menu_item 6 回滚配置 warning
         menu_item 7 参数设置
         menu_item 8 切换队列算法
-        menu_item 9 出口整形与扫描
         menu_item 0 退出 muted
         menu_read '请选择 [0]：' 0 || break
         case $REPLY in
@@ -1725,12 +1828,110 @@ interactive_menu() {
                 else printf '无法预览回滚，请查看上方原因。\n'; fi ;;
             7) menu_settings ;;
             8) menu_queue ;;
-            9) menu_shape ;;
             0) break ;;
-            *) printf '请选择 0～9。\n' ;;
+            *) printf '请选择 0～8。\n' ;;
         esac
     done
     printf '已退出菜单。\n'
+}
+
+smart_sweep_nominal() {
+    valid_positive "$BANDWIDTH" 10000 || die 'Integrated scanning needs bandwidth >0 and <=10000 Mbit/s; choose base-only tuning for other links'
+    SWEEP_NOMINAL=$(awk -v bandwidth="$BANDWIDTH" 'BEGIN {n=int(bandwidth+.5); if(n<1)n=1; print n}')
+}
+
+show_smart_sweep_plan() {
+    ((SMART_SWEEP)) || return 0
+    printf '  智能扫描  基础调优 → FQ → iperf3 基线/拐点扫描 → 重复验证\n'
+    printf '  扫描对端  %s:5201 · 参考带宽 %s Mbit/s（沿用本次带宽）\n' "$SWEEP_PEER" "$SWEEP_NOMINAL"
+    printf '  流量估算  最多 28 次 × 每次 8 秒测量 + 2 秒预热，约 %s GB 发送流量\n' "$(awk -v n="$SWEEP_NOMINAL" 'BEGIN {printf "%.2f",n*28*10/8000}')"
+    printf '            无整形实测速率可能超过参考值；该估算不是流量硬上限。\n'
+    printf '  队列影响  整张默认出口网卡使用 FQ；已有自有整形在扫描后恢复。\n'
+    if ((APPLY_SUGGESTED_SHAPE)); then
+        printf '  整形选择  仅当本次重复验证通过时自动应用建议；否则保留原整形状态。\n'
+    else
+        printf '  整形选择  只输出建议，不应用新的限速。\n'
+    fi
+    ((SWEEP_NOMINAL <= 2500)) || warn '2500 Mbit/s 以上扫描流量和 HTB CPU 开销较大，可能影响测量。'
+}
+
+smart_sweep_preflight() {
+    local required available output root classes route peer_iface expected actual
+    local -a interfaces=()
+    SMART_SWEEP_REUSE_QUEUE=0
+    for required in ip tc sysctl modprobe modinfo iperf3 jq timeout getent; do
+        command -v "$required" >/dev/null || die "智能扫描缺少 $required；先安装 apt-get install -y iproute2 procps kmod iperf3 jq coreutils，或选择仅基础调优。"
+    done
+    available=$(sysctl -n net.ipv4.tcp_available_congestion_control)
+    if [[ " $available " != *' bbr '* ]] && ! modinfo tcp_bbr >/dev/null 2>&1; then
+        die 'The current kernel cannot provide BBR; use base-only tuning/install a suitable kernel before scanning'
+    fi
+    mapfile -t interfaces < <({ ip -o -4 route show default; ip -o -6 route show default; } |
+        awk '{for(i=1;i<NF;i++) if($i=="dev") print $(i+1)}' | sort -u)
+    ((${#interfaces[@]} == 1)) || die 'Integrated scanning requires exactly one default-route interface'
+    SMART_SWEEP_IFACE=${interfaces[0]}
+    [[ $SMART_SWEEP_IFACE =~ ^[a-zA-Z0-9_.:-]{1,15}$ && $SMART_SWEEP_IFACE != . && $SMART_SWEEP_IFACE != .. ]] || die 'Invalid default interface'
+    local address
+    address=$(getent ahosts "$SWEEP_PEER" | awk 'NR==1 {print $1}') || die 'Cannot resolve the supplied peer'
+    [[ -n $address ]] || die 'Cannot resolve the supplied peer'
+    route=$(ip route get "$address") || die 'Cannot route to supplied peer'
+    peer_iface=$(awk '{for(i=1;i<NF;i++) if($i=="dev") {print $(i+1);exit}}' <<< "$route")
+    [[ $peer_iface == "$SMART_SWEEP_IFACE" ]] || die 'Peer route differs from the default interface; no settings changed'
+    shape_filter_guard "$SMART_SWEEP_IFACE" || die 'Existing queue filters cannot be replaced by integrated tuning'
+    shape_read_active || die 'Invalid shaping state'
+    if [[ -n $SHAPE_ACTIVE_IFACE ]]; then
+        shape_require_owned "$SMART_SWEEP_IFACE"
+        SMART_SWEEP_REUSE_QUEUE=1
+    else
+        output=$(tc qdisc show dev "$SMART_SWEEP_IFACE") || die 'Cannot inspect current queue'
+        root=$(awk '$1=="qdisc" {n++;if($4=="root") kind=$2} END {if(n==1)print kind}' <<< "$output")
+        [[ $root =~ ^(fq|fq_codel|cake|pfifo_fast)$ ]] || die 'Integrated tuning requires a simple single-root queue; mq/third-party shaping/extra hooks need a separate migration'
+        classes=$(tc class show dev "$SMART_SWEEP_IFACE") || die 'Cannot inspect current classes'
+        [[ -z $classes ]] || die 'Existing classes cannot be replaced by integrated tuning'
+        if [[ $root == cake ]] && grep -Eq 'bandwidth [0-9]' <<< "$output"; then die 'Existing CAKE rate limit must be handled before integrated tuning'; fi
+        if [[ -f $STATE/shaping/fq.$SMART_SWEEP_IFACE ]]; then
+            expected=$(cat "$STATE/shaping/fq.$SMART_SWEEP_IFACE")
+            actual=$(shape_signature "$SMART_SWEEP_IFACE")
+            if [[ $actual == "$expected" ]]; then SMART_SWEEP_REUSE_QUEUE=1
+            elif [[ $actual != "${expected/qdisc fq 7a00: root/qdisc fq 0: root}" ]]; then
+                die 'Managed queue was modified externally; reconcile it before integrated tuning'
+            fi
+        fi
+    fi
+    shape_owned_files_guard
+}
+
+smart_finish_tuning() {
+    local ACTION=queue QDISC=fq SHAPE_RATE='' SHAPE_OFF=0
+    local status rate rc
+    [[ $(sysctl -n net.ipv4.tcp_congestion_control) == bbr ]] || die 'BBR is not active; base tuning is saved, but the scan cannot proceed'
+    # Recheck immediately before replacing any live queue. This also catches
+    # changes made while the user was reviewing the plan.
+    smart_sweep_preflight
+    if ((SMART_SWEEP_REUSE_QUEUE == 0)); then switch_queue; fi
+    ensure_tmp
+    local SMART_SWEEP_RESULT_FILE
+    SMART_SWEEP_RESULT_FILE=$(mktemp "$TMP/smart-result.XXXXXX")
+    ACTION=sweep
+    print_heading '智能调优：基线、拐点扫描与复测'
+    # Ordinary calls retain errexit in the action and its persistence helpers.
+    run_shape_action
+    rc=$?; ((rc == 0)) || return "$rc"
+    # The slot is unique to this run, never a "latest" result or sourced code.
+    status=$(awk -F= '$1=="status" {n++;value=$2} END {if(n==1)print value}' "$SMART_SWEEP_RESULT_FILE")
+    if [[ $status != validated-suggestion ]]; then
+        log "智能调优完成：${status:-没有有效扫描结果}；未应用新的限速，保留基础调优及扫描前的整形状态。"
+        return 0
+    fi
+    rate=$(awk -F= '$1=="rate_mbps" {n++;value=$2} END {if(n==1)print value}' "$SMART_SWEEP_RESULT_FILE")
+    if [[ ! $rate =~ ^[1-9][0-9]{0,4}$ ]] || ((rate > 10000)); then die 'Invalid rate in the current validated result; no new shaping applied'; fi
+    if ((APPLY_SUGGESTED_SHAPE == 0)); then
+        log "本次建议整形速率 $rate Mbit/s；本次选择仅输出建议，未改变原整形状态。"
+        return 0
+    fi
+    ACTION=shape; SHAPE_RATE=$rate
+    print_heading "智能调优：应用已复测的 $rate Mbit/s 整形"
+    run_shape_action
 }
 
 # BEGIN OPTIONAL SHAPING
@@ -1740,6 +1941,18 @@ interactive_menu() {
 # queue fq explicitly creates root handle 7a00: fq before shape_mark_fq.
 
 validate_shape_args() {
+    if ((SMART_SWEEP || APPLY_SUGGESTED_SHAPE)); then
+        if [[ $ACTION != apply ]] || ((SMART == 0 || SMART_SWEEP == 0)); then die 'Integrated scanning requires apply --smart-bandwidth --smart-sweep'; fi
+        [[ $KERNEL == skip ]] || die 'Integrated scanning requires --kernel skip; boot a newly installed kernel before measuring'
+        [[ $SMART_PROFILE == bdp || $SMART_PROFILE == *-bdp ]] || die 'Integrated scanning requires a BDP profile'
+        ((TEST == 0)) || die 'Integrated scanning is disabled in container-test'
+        if [[ -n $SHAPE_RATE || -n $SWEEP_NOMINAL ]] || ((SHAPE_OFF)); then die 'Integrated scanning reuses bandwidth and a validated rate; do not specify shape/nominal options'; fi
+        [[ $SWEEP_PEER =~ ^[a-zA-Z0-9][a-zA-Z0-9.:-]{0,252}$ ]] || die '--smart-sweep requires --peer HOST (iperf3 port 5201)'
+        ((ACCEPT_TRAFFIC || DRY)) || die '--smart-sweep sends real traffic; pass --accept-traffic'
+        if ((QDISC_EXPLICIT)) && [[ $QDISC != fq ]]; then die 'Integrated scanning requires --qdisc fq'; fi
+        QDISC=fq; QDISC_EXPLICIT=1
+        return 0
+    fi
     if [[ $ACTION != shape && $ACTION != sweep ]]; then
         if [[ -n $SHAPE_RATE || -n $SWEEP_PEER || -n $SWEEP_NOMINAL ]] || ((SHAPE_OFF != 0 || ACCEPT_TRAFFIC != 0)); then die 'Shaping options require shape or sweep'; fi
         return 0
@@ -2111,7 +2324,11 @@ shape_run_sweep() {
         printf 'status=inconclusive-baseline\n' > "$SHAPE_LOG_DIR/result.txt"; return 0
     fi
     read -r lo hi step < <(awk -v a="$base_g" -v b="$base2_g" -v n="$SWEEP_NOMINAL" 'BEGIN {g=(a<b?a:b);lo=int(g*.95);if(lo<1)lo=1;hi=int(g*1.8);if(hi>n*1.25)hi=int(n*1.25);if(hi>10000)hi=10000;step=int((hi-lo+9)/10);if(step<1)step=1;print lo,hi,step}')
-    ((hi > lo)) || { log 'No usable scan interval'; return 0; }
+    if ((hi <= lo)); then
+        log 'No usable scan interval'
+        printf 'status=inconclusive-range\n' > "$SHAPE_LOG_DIR/result.txt"
+        return 0
+    fi
     log "Scanning upward from received goodput: $lo..$hi Mbit/s, step $step, threshold 0.1% estimated retrans/segments"
     rate=$lo
     for ((i=0; i<11 && rate<=hi; i++)); do
@@ -2208,8 +2425,10 @@ run_shape_action() (
     fi
     if ((DRY)); then log "DRY RUN: would run $ACTION on $SHAPE_IFACE; no iperf3, configuration, queue or service changes"; return 0; fi
     KERNEL=skip; preflight
-    exec 9>/run/lock/vps-tune.lock
-    flock -n 9 || die 'Another vps-tune is running'
+    if ((TUNE_LOCK_HELD == 0)); then
+        exec 9>/run/lock/vps-tune.lock
+        flock -n 9 || die 'Another vps-tune is running'
+    fi
     shape_require_owned "$SHAPE_IFACE"
     shape_owned_files_guard
     init_state
@@ -2227,6 +2446,9 @@ run_shape_action() (
         SWEEP_ADDRESS=$address
         SHAPE_RESTORE=1
         shape_run_sweep
+        if [[ -n $SMART_SWEEP_RESULT_FILE && -f $SHAPE_LOG_DIR/result.txt ]]; then
+            cp -- "$SHAPE_LOG_DIR/result.txt" "$SMART_SWEEP_RESULT_FILE"
+        fi
         return 0
     fi
     shape_backup_persistence
@@ -2303,14 +2525,17 @@ main() {
         preflight
         exec 9>/run/lock/vps-tune.lock
         flock -n 9 || die 'Another vps-tune is running'
+        TUNE_LOCK_HELD=1
     fi
     resolve_rtt
     resolve_bandwidth
+    if ((SMART_SWEEP)); then smart_sweep_nominal; fi
     choose_plan
     if ((REVIEW == 0)); then
         log "Plan: Debian $VERSION_ID ($CODENAME), kernel=${PACKAGE:-skip}, network=BBR+${QDISC^^}, nofile=$NOFILE, RAM=${MEM_MIB}MiB, buffer ceiling=${BUFFER}MiB"
         if ((SMART)); then log "$(buffer_plan_description)"; fi
         show_buffer_notice
+        show_smart_sweep_plan
     elif ((DRY)); then
         show_tuning_plan
         show_buffer_notice
@@ -2325,6 +2550,7 @@ main() {
     if ((REVIEW)); then
         if ! review_tuning_plan; then log '预览结束，未写入调优配置。'; return; fi
     fi
+    if ((SMART_SWEEP)); then smart_sweep_preflight; fi
     init_state
     if ! command -v sysctl >/dev/null || ! command -v modprobe >/dev/null || ! command -v tc >/dev/null; then
         apt_update
@@ -2334,6 +2560,10 @@ main() {
     configure_limits
     configure_network
     apply_runtime
+    if ((SMART_SWEEP)); then
+        SMART_BASE_APPLIED=1
+        smart_finish_tuning
+    fi
     if ((TEST)); then
         warn 'CONTAINER TEST finished. This does not prove kernel boot, host sysctls or throughput gains'
     else

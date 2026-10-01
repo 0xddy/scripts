@@ -3,7 +3,7 @@
 # shellcheck disable=SC2034,SC2317
 set -Eeuo pipefail
 target_script=${1:-${TARGET_SCRIPT:-$(dirname "${BASH_SOURCE[0]}")/../vps-tune.sh}}
-JQ_TEST_BIN=${2:-jq}
+JQ_TEST_BIN=${2:-$(type -P jq)}
 saved_path=$PATH
 # shellcheck source=/dev/null
 source "$target_script"
