@@ -283,6 +283,83 @@ test_shape_args() {
     parse_bad sweep --peer 192.0.2.1 --nominal-mbps 500 --container-test --dry-run || return
 }
 
+test_sweep_peer_validation() {
+    load_script
+    local peer
+    local -a valid=(
+        iperf.example.com localhost server01 peer-01 1peer.example peer.example.
+        192.0.2.1 203.0.113.255
+        :: ::1 2001:db8::1 2001:db8::5201 1:2:3:4:5:6:7::
+        2001:0db8:0000:0000:0000:0000:0000:0001
+        ::ffff:192.0.2.1
+    )
+    local -a invalid=(
+        '' 5201 00005201 2130706433 5201. 127.1 127.0.1
+        0177.0.0.1 127.0.0.01 0x7f000001 0x7f.1 0x7f.0.0.1 127.0x0.0.1
+        256.0.0.1 192.0.2.256 192.0.2.1. 123.456
+        peer:5201 192.0.2.1:5201 'https://iperf.example.com' 'peer/path'
+        '[2001:db8::1]' '[2001:db8::1]:5201' 'fe80::1%eth0'
+        2001:db8::1::2 1:2:3:4:5:6:7 1:2:3:4:5:6:7:8:9
+        ::1: 1::2: 2001:db8::1: 1:2:3:4:5:6::192.0.2.1
+        2001:db8::gg 2001:db8::12345 :::1 ::ffff:192.0.2.999 ::ffff:192.0.2.01
+        -peer peer- _peer.example peer..example .peer.example 'peer name' 'host;id'
+    )
+    # Address syntax validation must not resolve hosts or start any client.
+    PEER_EVENTS="$HARNESS_TMP/peer-validation-events"
+    : > "$PEER_EVENTS"
+    getent() { printf 'getent\n' >> "$PEER_EVENTS"; return 92; }
+    iperf3() { printf 'iperf3\n' >> "$PEER_EVENTS"; return 92; }
+    for peer in "${valid[@]}"; do
+        valid_sweep_peer "$peer" || { printf 'Valid peer rejected: <%s>\n' "$peer" >&2; return 1; }
+        parse_ok sweep --peer "$peer" --nominal-mbps 500 --dry-run || return
+    done
+    for peer in "${invalid[@]}"; do
+        if valid_sweep_peer "$peer"; then printf 'Invalid peer accepted: <%s>\n' "$peer" >&2; return 1; fi
+        parse_bad sweep --peer "$peer" --nominal-mbps 500 --dry-run || return
+    done
+    [[ ! -s $PEER_EVENTS ]]
+}
+
+test_sweep_peer_resolution() {
+    load_script
+    local peer address
+    PEER_EVENTS="$HARNESS_TMP/peer-resolution-events"
+    : > "$PEER_EVENTS"
+    GETENT_OUTPUT='198.51.100.7 STREAM iperf.example.com'
+    GETENT_RC=0
+    getent() {
+        assert_eq "$1" ahosts || return
+        printf '%s\n' "$*" >> "$PEER_EVENTS"
+        printf '%s\n' "$GETENT_OUTPUT"
+        return "$GETENT_RC"
+    }
+    for peer in 192.0.2.1 ::1 2001:db8::5201 ::ffff:192.0.2.1; do
+        address=$(resolve_sweep_peer "$peer") || return
+        assert_eq "$address" "$peer" || return
+    done
+    for peer in 5201 127.1 0x7f000001 0177.0.0.1 'iperf.example.com:5201'; do
+        if (resolve_sweep_peer "$peer") > "$HARNESS_TMP/resolve.log" 2>&1; then return 1; fi
+    done
+    [[ ! -s $PEER_EVENTS ]] || { printf 'Literal or invalid peer reached name resolution\n' >&2; return 1; }
+    address=$(resolve_sweep_peer iperf.example.com) || return
+    assert_eq "$address" 198.51.100.7 || return
+    assert_eq "$(cat "$PEER_EVENTS")" 'ahosts iperf.example.com' || return
+    GETENT_OUTPUT='2001:db8::7 STREAM iperf.example.com'
+    address=$(resolve_sweep_peer iperf.example.com) || return
+    assert_eq "$address" 2001:db8::7 || return
+    for GETENT_OUTPUT in '' '5201 STREAM peer' '127.1 STREAM peer' '0177.0.0.1 STREAM peer' \
+        '0x7f000001 STREAM peer' 'name.example STREAM peer' '-option STREAM peer'; do
+        if (resolve_sweep_peer iperf.example.com) > "$HARNESS_TMP/resolve.log" 2>&1; then
+            printf 'Invalid resolver result accepted: <%s>\n' "$GETENT_OUTPUT" >&2; return 1
+        fi
+    done
+    GETENT_OUTPUT='198.51.100.7 STREAM iperf.example.com'
+    GETENT_RC=2
+    if (resolve_sweep_peer iperf.example.com) > "$HARNESS_TMP/resolve.log" 2>&1; then
+        printf 'Failed name resolution was ignored\n' >&2; return 1
+    fi
+}
+
 test_sweep_model() {
     local model=$1
     load_script
@@ -511,6 +588,8 @@ case_run 'TCP budget: exact page-size and memory boundaries' test_memory
 case_run 'BDP: examples, rounding boundaries, monotonicity, legacy profiles' test_bdp
 case_run 'CLI accepts existing forms and rejects invalid/conflicting inputs' test_args
 case_run 'Shape/sweep argument validation and traffic consent' test_shape_args
+case_run 'Sweep peers reject port-only, ambiguous IPv4 and malformed addresses before resolution' test_sweep_peer_validation
+case_run 'Sweep resolution skips IP literals and rejects non-IP or failed DNS results' test_sweep_peer_resolution
 case_run 'Plan and manual buffer honor page size and cap' test_choose
 case_run 'Dry-run never calls mutation functions' test_dry
 case_run 'Apply rejects incompatible queue while shaping is active' test_active_shaping_apply_guard

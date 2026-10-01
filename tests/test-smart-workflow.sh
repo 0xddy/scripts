@@ -82,6 +82,19 @@ test_parser_rejections() {
     parse_bad check --smart-sweep --peer 192.0.2.1 --accept-traffic
 }
 
+test_integrated_peer_validation() {
+    smart_args
+    local peer
+    for peer in iperf.example.com peer-01 192.0.2.1 2001:db8::1 ::1 ::ffff:192.0.2.1; do
+        parse_ok "${SMART_ARGS[@]}" --peer "$peer"
+    done
+    for peer in 5201 2130706433 127.1 0177.0.0.1 192.0.2.01 0x7f000001 \
+        iperf.example.com:5201 192.0.2.1:5201 'https://iperf.example.com' '[2001:db8::1]:5201'; do
+        parse_bad "${SMART_ARGS[@]}" --peer "$peer"
+        parse_bad "${SMART_ARGS[@]}" --peer "$peer" --dry-run
+    done
+}
+
 test_nominal() {
     load_script
     SMART_SWEEP=1
@@ -397,7 +410,9 @@ setup_menu() {
     : > "$MENU_CAPTURE"; : > "$MENU_CALLS"
     is_container() { return "$MENU_CONTAINER"; }
     menu_run() { printf '%s\n' "$@" > "$MENU_CAPTURE"; printf 'run\n' >> "$MENU_CALLS"; }
-    menu_shape() { printf 'advanced\n' >> "$MENU_CALLS"; }
+    if [[ ${1:-} != shape ]]; then
+        menu_shape() { printf 'advanced\n' >> "$MENU_CALLS"; }
+    fi
 }
 
 menu_has() { grep -Fxq -- "$1" "$MENU_CAPTURE"; }
@@ -430,6 +445,45 @@ test_menu_scan_only() {
     menu_has --smart-sweep
     menu_has --accept-traffic
     menu_lacks --apply-suggested-shape
+    menu_parses
+}
+
+test_menu_peer_validation() {
+    local peer input
+    for peer in 5201 2130706433 127.1 0177.0.0.1 0x7f000001 \
+        iperf.example.com:5201 'https://iperf.example.com' '[2001:db8::1]:5201'; do
+        setup_menu
+        printf -v input '1\n5\n2\n500\ny\n%s\ny\ny\n' "$peer"
+        menu_smart <<< "$input"
+        assert_eq "$(cat "$MENU_CALLS")" ''
+        [[ ! -s $MENU_CAPTURE ]]
+    done
+    # A legitimate IPv6 host is passed intact; the fixed port is never appended.
+    setup_menu
+    menu_smart <<< $'1\n5\n2\n500\ny\n2001:db8::1\nn\ny'
+    assert_eq "$(cat "$MENU_CALLS")" run
+    menu_has 2001:db8::1
+    menu_has --peer
+    menu_parses
+}
+
+test_advanced_menu_peer_validation() {
+    local choice peer input
+    for choice in 1 2; do
+        for peer in 5201 127.1 0x7f000001 'iperf.example.com:5201'; do
+            setup_menu shape
+            bash() { printf 'preview-subprocess\n' >> "$MENU_CALLS"; return 92; }
+            printf -v input '%s\n%s\n500\ny\n' "$choice" "$peer"
+            menu_shape <<< "$input"
+            assert_eq "$(cat "$MENU_CALLS")" ''
+            [[ ! -s $MENU_CAPTURE ]]
+        done
+    done
+    setup_menu shape
+    menu_shape <<< $'1\n2001:db8::5201\n500'
+    assert_eq "$(cat "$MENU_CALLS")" run
+    menu_has 2001:db8::5201
+    menu_has --dry-run
     menu_parses
 }
 
@@ -596,6 +650,7 @@ case_run() {
 
 case_run 'Integrated CLI accepts BDP and authorized scan inputs' test_parser_valid
 case_run 'Integrated CLI rejects conflicting, unauthorized and container inputs' test_parser_rejections
+case_run 'Integrated CLI rejects port-only and ambiguous peers, including previews' test_integrated_peer_validation
 case_run 'Resolved bandwidth supplies rounded and bounded scan nominal' test_nominal
 case_run 'Read-only preflight accepts simple queues and recognizes owned state' test_preflight_simple_and_owned
 case_run 'Preflight rejects ambiguous routes, custom queues/filters and unavailable BBR' test_preflight_rejections
@@ -610,6 +665,8 @@ case_run 'Cancelling reviewed smart plan performs no mutations or traffic' test_
 case_run 'Main applies base tuning before owned queue, scan and validated cap' test_main_sequence
 case_run 'Smart menu runs full tuning once with explicit traffic and cap consent' test_menu_complete
 case_run 'Smart menu can scan without applying its suggestion' test_menu_scan_only
+case_run 'Smart menu rejects invalid peers before dispatch and passes IPv6 intact' test_menu_peer_validation
+case_run 'Advanced menu rejects invalid peers before preview and preserves IPv6 literals' test_advanced_menu_peer_validation
 case_run 'Declining scanning or traffic consent leaves only base tuning' test_menu_skip_scan
 case_run 'Basic and legacy smart menu options remain usable' test_menu_basic_and_legacy
 case_run 'Menu cancellation and container protection do not run live tuning' test_menu_cancel_container
