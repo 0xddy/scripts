@@ -62,6 +62,9 @@ SMART_SWEEP_REUSE_QUEUE=0
 SMART_SWEEP_RESULT_FILE=
 SMART_BASE_APPLIED=0
 TUNE_LOCK_HELD=0
+SCAN_TOOLS_ROOT=
+PERSIST_SCAN_TOOLS=0
+TOOLS_STAGING=
 
 ui_text() {
     local tone=$1 value=$2 code=
@@ -121,7 +124,11 @@ format_metric() {
     else awk -v value="$1" -v unit="$2" 'BEGIN {printf "%.2f %s", value, unit}'; fi
 }
 
-cleanup() { stop_spinner; [[ -z $TMP ]] || rm -rf -- "$TMP"; }
+cleanup() {
+    stop_spinner
+    [[ -z $TOOLS_STAGING ]] || rm -rf -- "$TOOLS_STAGING"
+    [[ -z $TMP ]] || rm -rf -- "$TMP"
+}
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
@@ -157,6 +164,8 @@ Usage: bash vps-tune.sh                    # Chinese interactive menu
   --smart-sweep           With smart apply + --kernel skip: prepare fq, scan
                           --peer HOST, and reuse the resolved bandwidth.
                           Requires --accept-traffic unless --dry-run.
+                          Missing tools use an isolated Debian runtime;
+                          no global package installation for scanning.
   --apply-suggested-shape With --smart-sweep: apply only a validated suggestion.
   shape --rate-mbps NUMBER Apply an aggregate egress cap with HTB + fq.
   shape --off             Remove owned shaping; keep base tuning and fq.
@@ -1835,6 +1844,370 @@ interactive_menu() {
     printf '已退出菜单。\n'
 }
 
+# BEGIN ISOLATED TOOL RUNTIME
+# Build a relocatable userspace bundle without installing packages on the host.
+# DEST must be a new directory below the caller-owned, private TMP directory.
+# Successful builds expose only the explicitly requested commands in DEST/bin.
+isolated_tools_error() { printf '隔离依赖：%s\n' "$*" >&2; return 1; }
+
+isolated_tools_archive_safe() {
+    local archive=$1 listing=$2
+    LC_ALL=C tar --numeric-owner --full-time -tvf "$archive" > "$listing" || return 1
+    # Debian data archives do not need whitespace, quoted names, devices or
+    # symlink ancestors. Reject these before dpkg-deb can extract any data.
+    LC_ALL=C awk '
+        function safe(p) {
+            return p ~ /^\.\/[][A-Za-z0-9_.\/+@:%=-]*$/ && p !~ /(^|\/)\.\.(\/|$)/ && p !~ /\/\// && substr(p,3) !~ /(^|\/)\.(\/|$)/
+        }
+        {
+            type=substr($1,1,1); path=$6
+            sub(/\/$/, "", path)
+            if(path==".") path="./"
+            if(!safe(path) || seen[path]++ || type !~ /^[-dlh]$/) exit 1
+            paths[path]=1
+            if(type=="l") {
+                if(NF!=8 || $7!="->" || $8 !~ /^[][A-Za-z0-9_.\/+@:%=-]+$/) exit 1
+                links[path]=1
+            } else if(type=="h") {
+                if(NF!=9 || $7!="link" || $8!="to" || !safe($9)) exit 1
+                links[path]=1; targets[$9]=1
+            } else if(NF!=6) exit 1
+        }
+        END {
+            for(path in paths) {
+                ancestor=path
+                while(sub(/\/[^/]+$/, "", ancestor)) if(ancestor in links) exit 1
+            }
+            for(path in targets) {
+                if(!(path in paths) || path in links) exit 1
+                ancestor=path
+                while(sub(/\/[^/]+$/, "", ancestor)) if(ancestor in links) exit 1
+            }
+        }
+    ' "$listing"
+}
+
+isolated_tools_rebase_links() {
+    local root=$1 link target normalized relative
+    # find does not follow links. Make absolute archive links relative before
+    # another package can write through them; all resolution remains in root.
+    while IFS= read -r -d '' link; do
+        target=$(readlink -- "$link") || return 1
+        if [[ $target == /* ]]; then
+            normalized=$(realpath -ms -- "$root$target") || return 1
+            [[ $normalized == "$root" || $normalized == "$root/"* ]] || return 1
+            relative=$(realpath -ms --relative-to="$(dirname -- "$link")" -- "$normalized") || return 1
+            ln -snf -- "$relative" "$link" || return 1
+        else
+            normalized=$(realpath -ms -- "$(dirname -- "$link")/$target") || return 1
+            [[ $normalized == "$root" || $normalized == "$root/"* ]] || return 1
+        fi
+    done < <(find "$root" -type l -print0)
+    # This second pass also catches chains escaping via a relative ancestor.
+    while IFS= read -r -d '' link; do
+        normalized=$(readlink -m -- "$link") || return 1
+        [[ $normalized == "$root" || $normalized == "$root/"* ]] || return 1
+    done < <(find "$root" -type l -print0)
+}
+
+isolated_tools_merge_tree() {
+    local stage=$1 root=$2 source path parent resolved target
+    # Copy entry by entry, validating the live destination before every write.
+    # This also supports Debian usrmerge directory links without following any
+    # link outside the private root, including links from earlier packages.
+    while IFS= read -r -d '' source; do
+        path=$root/${source#"$stage/"}
+        resolved=$(readlink -m -- "$path") || return 1
+        [[ $resolved == "$root/"* ]] || return 1
+        mkdir -p -- "$path" || return 1
+        chmod --reference="$source" -- "$path" || return 1
+    done < <(find "$stage" -mindepth 1 -type d -print0)
+    while IFS= read -r -d '' source; do
+        path=$root/${source#"$stage/"}
+        parent=$(dirname -- "$path") || return 1
+        resolved=$(readlink -f -- "$parent") || return 1
+        [[ $resolved == "$root" || $resolved == "$root/"* ]] || return 1
+        if [[ -L $source ]]; then
+            target=$(readlink -- "$source") || return 1
+            resolved=$(readlink -m -- "$parent/$target") || return 1
+            [[ $resolved == "$root" || $resolved == "$root/"* ]] || return 1
+        fi
+        # Never follow an old destination symlink when replacing a file.
+        cp -aT --remove-destination -- "$source" "$path" || return 1
+    done < <(find "$stage" -mindepth 1 ! -type d -print0)
+    isolated_tools_rebase_links "$root"
+}
+
+isolated_tools_build() (
+    umask 077
+    local destination=${1:-} task_tmp root aptdir package command candidate resolved
+    local architecture codename loader_name loader library_path='' directory archive data
+    local -a packages=() commands=() archives=()
+    shift || { isolated_tools_error '缺少目标目录和包名。'; return 1; }
+    [[ $# -gt 0 ]] || { isolated_tools_error '未指定依赖包。'; return 1; }
+    for command in apt-get dpkg dpkg-deb tar awk find realpath readlink mkdir chmod dirname ln rm cat cp; do
+        command -v "$command" >/dev/null 2>&1 || { isolated_tools_error "缺少引导工具 $command；请由管理员预先提供，本脚本不安装系统包。"; return 1; }
+    done
+    [[ -r /usr/share/keyrings/debian-archive-keyring.gpg && -s /etc/ssl/certs/ca-certificates.crt ]] || {
+        isolated_tools_error '需要系统已有 Debian archive keyring 与 CA 证书；不会绕过签名/TLS 校验或安装系统包。'; return 1;
+    }
+    [[ -n ${TMP:-} && -d $TMP && ! -L $TMP ]] || { isolated_tools_error 'TMP 必须是现有私有临时目录。'; return 1; }
+    task_tmp=$(readlink -f -- "$TMP") || return 1
+    destination=$(realpath -ms -- "$destination") || return 1
+    [[ $destination =~ ^/[a-zA-Z0-9_./+-]+$ ]] || { isolated_tools_error '隔离目录包含不支持的路径字符。'; return 1; }
+    [[ $destination == "$task_tmp/"* && ! -e $destination && ! -L $destination ]] || {
+        isolated_tools_error '目标必须是 TMP 内尚不存在的子目录。'; return 1;
+    }
+    resolved=$(readlink -m -- "$(dirname -- "$destination")") || return 1
+    [[ $resolved == "$task_tmp" || $resolved == "$task_tmp/"* ]] || { isolated_tools_error '目标父目录越过 TMP。'; return 1; }
+    architecture=$(dpkg --print-architecture) || return 1
+    case $architecture in
+        amd64) loader_name=ld-linux-x86-64.so.2 ;;
+        arm64) loader_name=ld-linux-aarch64.so.1 ;;
+        *) isolated_tools_error "暂不支持架构 $architecture。"; return 1 ;;
+    esac
+    # Read OS identity as data, without executing /etc/os-release.
+    codename=$(awk -F= '$1=="VERSION_ID" {gsub(/"/,"",$2); print $2; exit}' /etc/os-release) || return 1
+    case $codename in 12) codename=bookworm ;; 13) codename=trixie ;; *) isolated_tools_error '仅支持 Debian 12/13。'; return 1 ;; esac
+    [[ $(awk -F= '$1=="ID" {gsub(/"/,"",$2); print $2; exit}' /etc/os-release) == debian ]] || { isolated_tools_error '需要 Debian 系统。'; return 1; }
+    for package in "$@"; do
+        case $package in
+            iproute2) commands+=(ip tc) ;;
+            procps) commands+=(sysctl) ;;
+            kmod) commands+=(modprobe modinfo) ;;
+            iperf3) commands+=(iperf3) ;;
+            jq) commands+=(jq) ;;
+            coreutils) commands+=(timeout) ;;
+            libc-bin) commands+=(getent) ;;
+            *) isolated_tools_error "不支持请求依赖包 $package。"; return 1 ;;
+        esac
+        packages+=("$package")
+    done
+    root=$destination/root
+    aptdir=$destination/apt
+    mkdir -p "$root" "$destination/bin" "$aptdir/state/lists/partial" "$aptdir/cache/archives/partial" "$aptdir/log" "$aptdir/empty" || return 1
+    : > "$aptdir/state/status" || return 1
+    : > "$aptdir/empty.conf" || return 1
+    cat > "$aptdir/sources.list" <<EOF
+deb [arch=$architecture signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] https://deb.debian.org/debian $codename main
+deb [arch=$architecture signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] https://deb.debian.org/debian $codename-updates main
+deb [arch=$architecture signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] https://security.debian.org/debian-security $codename-security main
+EOF
+    cat > "$aptdir/apt.conf" <<EOF
+Dir::Etc "$aptdir";
+Dir::Etc::main "$aptdir/empty.conf";
+Dir::Etc::parts "$aptdir/empty";
+Dir::Etc::sourcelist "$aptdir/sources.list";
+Dir::Etc::sourceparts "$aptdir/empty";
+Dir::Etc::preferences "$aptdir/empty.conf";
+Dir::Etc::preferencesparts "$aptdir/empty";
+Dir::Etc::trusted "$aptdir/empty.gpg";
+Dir::Etc::trustedparts "$aptdir/empty";
+Dir::State "$aptdir/state";
+Dir::State::status "$aptdir/state/status";
+Dir::State::extended_states "$aptdir/state/extended_states";
+Dir::State::lists "$aptdir/state/lists";
+Dir::Cache "$aptdir/cache";
+Dir::Cache::archives "$aptdir/cache/archives";
+Dir::Cache::pkgcache "";
+Dir::Cache::srcpkgcache "";
+Dir::Log "$aptdir/log";
+APT::Architecture "$architecture";
+APT::Architectures { "$architecture"; };
+APT::Install-Recommends "false";
+APT::Install-Suggests "false";
+APT::Get::AllowUnauthenticated "false";
+Acquire::AllowInsecureRepositories "false";
+Acquire::AllowDowngradeToInsecureRepositories "false";
+Acquire::Check-Valid-Until "true";
+Acquire::https::Verify-Peer "true";
+Acquire::https::Verify-Host "true";
+Acquire::Retries "3";
+Acquire::Languages "none";
+Acquire::http::Timeout "30";
+Acquire::https::Timeout "30";
+APT::Update::Error-Mode "any";
+APT::Sandbox::User "root";
+DPkg::Use-Pty "0";
+#clear DPkg::Pre-Invoke;
+#clear DPkg::Post-Invoke;
+#clear DPkg::Pre-Install-Pkgs;
+#clear APT::Update::Pre-Invoke;
+#clear APT::Update::Post-Invoke;
+#clear APT::Update::Post-Invoke-Success;
+EOF
+    printf '隔离下载依赖（%s/%s），不会安装系统包：%s\n' "$codename" "$architecture" "${packages[*]}" >&2
+    APT_CONFIG="$aptdir/apt.conf" apt-get update || { isolated_tools_error '官方源索引下载或签名校验失败。'; return 1; }
+    APT_CONFIG="$aptdir/apt.conf" apt-get --download-only --no-install-recommends --no-install-suggests -y install "${packages[@]}" || {
+        isolated_tools_error '依赖闭包下载失败。'; return 1;
+    }
+    shopt -s nullglob
+    archives=("$aptdir/cache/archives/"*.deb)
+    ((${#archives[@]})) || { isolated_tools_error '未下载任何依赖包。'; return 1; }
+    : > "$destination/packages.tsv" || return 1
+    for archive in "${archives[@]}"; do
+        # The template is expanded by dpkg-deb, not Bash.
+        # shellcheck disable=SC2016
+        dpkg-deb --show --showformat='${Package}\t${Version}\t${Architecture}\n' "$archive" >> "$destination/packages.tsv" || return 1
+        data=$aptdir/data.tar
+        dpkg-deb --fsys-tarfile "$archive" > "$data" || return 1
+        isolated_tools_archive_safe "$data" "$aptdir/members.txt" || { isolated_tools_error "不安全的包数据路径：${archive##*/}"; return 1; }
+        rm -rf -- "$aptdir/stage" || return 1
+        mkdir -- "$aptdir/stage" || return 1
+        dpkg-deb -x "$archive" "$aptdir/stage" || return 1
+        isolated_tools_rebase_links "$aptdir/stage" || { isolated_tools_error "包链接越过隔离目录：${archive##*/}"; return 1; }
+        isolated_tools_merge_tree "$aptdir/stage" "$root" || { isolated_tools_error "包合并路径不安全：${archive##*/}"; return 1; }
+    done
+    loader=''
+    while IFS= read -r -d '' candidate; do
+        resolved=$(readlink -f -- "$candidate") || return 1
+        [[ $resolved == "$root/"* && -f $resolved && -x $resolved ]] || continue
+        loader=${resolved#"$root/"}; break
+    done < <(find "$root" -name "$loader_name" -print0)
+    [[ -n $loader ]] || { isolated_tools_error '隔离依赖缺少可执行的 glibc loader。'; return 1; }
+    for directory in lib lib64 lib/$architecture-linux-gnu usr/lib usr/lib64 usr/lib/$architecture-linux-gnu; do
+        # Debian amd64 uses the x86_64 multiarch directory.
+        case $directory in *amd64-linux-gnu) directory=${directory%amd64-linux-gnu}x86_64-linux-gnu ;; *arm64-linux-gnu) directory=${directory%arm64-linux-gnu}aarch64-linux-gnu ;; esac
+        [[ -d $root/$directory ]] || continue
+        library_path+="${library_path:+:}\$bundle/root/$directory"
+    done
+    [[ -n $library_path ]] || { isolated_tools_error '隔离依赖缺少共享库目录。'; return 1; }
+    for command in "${commands[@]}"; do
+        resolved=''
+        for directory in usr/bin usr/sbin bin sbin; do
+            candidate=$root/$directory/$command
+            [[ -e $candidate ]] || continue
+            resolved=$(readlink -f -- "$candidate") || return 1
+            [[ $resolved == "$root/"* && -f $resolved && -x $resolved ]] || { isolated_tools_error "工具路径不安全：$command"; return 1; }
+            break
+        done
+        [[ -n $resolved ]] || { isolated_tools_error "下载依赖缺少命令 $command。"; return 1; }
+        candidate=${resolved#"$root/"}
+        cat > "$destination/bin/$command" <<EOF
+#!/bin/bash
+set -euo pipefail
+bundle=\$(cd -- "\$(dirname -- "\${BASH_SOURCE[0]}")/.." && pwd -P)
+exec "\$bundle/root/$loader" --inhibit-cache --library-path "$library_path" --argv0 "$command" "\$bundle/root/$candidate" "\$@"
+EOF
+        chmod 700 "$destination/bin/$command" || return 1
+    done
+    # Every wrapper must run before the caller can persist this directory.
+    for command in "${commands[@]}"; do
+        case $command in ip|tc) "$destination/bin/$command" -V >/dev/null ;; *) "$destination/bin/$command" --version >/dev/null ;; esac || {
+            isolated_tools_error "隔离工具验证失败：$command"; return 1;
+        }
+    done
+    rm -rf -- "$aptdir" || return 1
+)
+# END ISOLATED TOOL RUNTIME
+
+# Include modes and symlink targets as well as file contents. Runtime directory
+# names are these digests, so later commands never silently accept local edits.
+isolated_tools_fingerprint() (
+    cd -- "$1" || return 1
+    {
+        find . -printf '%y %m %p %l\0' | sort -z
+        find . -type f -print0 | sort -z | xargs -0 -r sha256sum --zero --
+    } | sha256sum | awk '{print $1}'
+)
+
+activate_persistent_tools() {
+    local runtime digest actual
+    [[ -e $STATE/tools || -L $STATE/tools ]] || return 0
+    [[ -d $STATE/tools && ! -L $STATE/tools ]] || die 'Invalid isolated tools directory'
+    for runtime in "$STATE"/tools/*; do
+        [[ -e $runtime || -L $runtime ]] || continue
+        digest=${runtime##*/}
+        [[ $digest =~ ^[a-f0-9]{64}$ && -d $runtime && ! -L $runtime && -d $runtime/bin && ! -L $runtime/bin ]] || die "Unexpected isolated runtime: $runtime"
+        actual=$(isolated_tools_fingerprint "$runtime") || die "Cannot verify isolated runtime: $runtime"
+        [[ $actual == "$digest" ]] || die "Isolated runtime changed externally: $runtime; restore its files before retrying"
+        case :$PATH: in
+            *":$runtime/bin:"*) ;;
+            *) PATH="$runtime/bin:$PATH" ;;
+        esac
+    done
+    export PATH
+    hash -r
+}
+
+prepare_scan_tools() {
+    ((DRY == 0)) || return 0
+    local tool package
+    local -a missing=() packages=()
+    local -A seen=() needed=()
+    for tool in ip tc sysctl modprobe modinfo iperf3 jq timeout getent; do
+        command -v "$tool" >/dev/null && continue
+        missing+=("$tool"); needed[$tool]=1
+        case $tool in
+            ip|tc) package=iproute2; PERSIST_SCAN_TOOLS=1 ;;
+            sysctl) package=procps; PERSIST_SCAN_TOOLS=1 ;;
+            modprobe|modinfo) package=kmod; PERSIST_SCAN_TOOLS=1 ;;
+            iperf3|jq) package=$tool ;;
+            timeout) package=coreutils ;;
+            getent) package=libc-bin ;;
+        esac
+        if [[ -z ${seen[$package]:-} ]]; then packages+=("$package"); seen[$package]=1; fi
+    done
+    ((${#missing[@]})) || return 0
+    ensure_tmp
+    SCAN_TOOLS_ROOT=$TMP/scan-tools
+    log "在独立目录准备缺少的扫描工具：${missing[*]}（不安装到系统）"
+    isolated_tools_build "$SCAN_TOOLS_ROOT" "${packages[@]}"
+    # A package can supply several commands; preserve every command that was
+    # already available, including binaries from earlier isolated runtimes.
+    for tool in "$SCAN_TOOLS_ROOT"/bin/*; do
+        [[ -e $tool || -L $tool ]] || continue
+        if [[ -z ${needed[${tool##*/}]:-} ]]; then rm -- "$tool"; fi
+    done
+    for tool in "${missing[@]}"; do
+        [[ -x $SCAN_TOOLS_ROOT/bin/$tool ]] || die "Isolated runtime did not provide $tool"
+    done
+    PATH="$SCAN_TOOLS_ROOT/bin:$PATH"; export PATH
+    hash -r
+    if ((PERSIST_SCAN_TOOLS)); then
+        log '缺少开机整形所需工具；预检通过后将保留已验证的独立运行环境。'
+    else
+        log '扫描工具仅在本次运行可见，退出时清理。'
+    fi
+}
+
+persist_scan_tools() {
+    ((PERSIST_SCAN_TOOLS)) || return 0
+    local digest destination old_bin
+    [[ -n $SCAN_TOOLS_ROOT && -d $SCAN_TOOLS_ROOT/bin ]] || die 'Missing prepared isolated runtime'
+    digest=$(isolated_tools_fingerprint "$SCAN_TOOLS_ROOT") || die 'Cannot fingerprint isolated runtime'
+    [[ $digest =~ ^[a-f0-9]{64}$ ]] || die 'Invalid isolated runtime digest'
+    [[ ! -L $STATE/tools ]] || die 'Refusing symlink for isolated runtime storage'
+    install -d -m 700 "$STATE/tools"
+    destination=$STATE/tools/$digest
+    if [[ -e $destination || -L $destination ]]; then
+        [[ -d $destination && ! -L $destination ]] || die 'Invalid existing isolated runtime'
+        [[ $(isolated_tools_fingerprint "$destination") == "$digest" ]] || die 'Existing isolated runtime was modified'
+    else
+        TOOLS_STAGING=$(mktemp -d "$STATE/tools/.staging.XXXXXXXX")
+        cp -a -- "$SCAN_TOOLS_ROOT/." "$TOOLS_STAGING/"
+        [[ $(isolated_tools_fingerprint "$TOOLS_STAGING") == "$digest" ]] || die 'Isolated runtime copy verification failed'
+        mv -T -- "$TOOLS_STAGING" "$destination"
+        TOOLS_STAGING=
+    fi
+    old_bin=$SCAN_TOOLS_ROOT/bin
+    PATH=${PATH#"$old_bin:"}
+    SCAN_TOOLS_ROOT=$destination
+    PATH="$SCAN_TOOLS_ROOT/bin:$PATH"; export PATH
+    hash -r
+    PERSIST_SCAN_TOOLS=0
+    # An older active cap may be retained after a low-retransmission scan.
+    # Upgrade its launcher now so the retained cap can also use these tools
+    # after reboot, even when no new shaping rate is applied this run.
+    shape_read_active || die 'Invalid shaping state'
+    if [[ -n $SHAPE_ACTIVE_IFACE ]]; then
+        shape_owned_files_guard
+        local SHAPE_IFACE=$SHAPE_ACTIVE_IFACE SHAPE_RATE=$SHAPE_ACTIVE_RATE
+        shape_write_service
+    fi
+    log "开机所需工具保存在 $STATE/tools；未修改系统软件包数据库。"
+}
+
 smart_sweep_nominal() {
     valid_positive "$BANDWIDTH" 10000 || die 'Integrated scanning needs bandwidth >0 and <=10000 Mbit/s; choose base-only tuning for other links'
     SWEEP_NOMINAL=$(awk -v bandwidth="$BANDWIDTH" 'BEGIN {n=int(bandwidth+.5); if(n<1)n=1; print n}')
@@ -1847,6 +2220,7 @@ show_smart_sweep_plan() {
     printf '  流量估算  最多 28 次 × 每次 8 秒测量 + 2 秒预热，约 %s GB 发送流量\n' "$(awk -v n="$SWEEP_NOMINAL" 'BEGIN {printf "%.2f",n*28*10/8000}')"
     printf '            无整形实测速率可能超过参考值；该估算不是流量硬上限。\n'
     printf '  队列影响  整张默认出口网卡使用 FQ；已有自有整形在扫描后恢复。\n'
+    printf '  工具环境  缺失依赖在独立目录准备；通常用后清理，缺开机工具时保留该运行环境。\n'
     if ((APPLY_SUGGESTED_SHAPE)); then
         printf '  整形选择  仅当本次重复验证通过时自动应用建议；否则保留原整形状态。\n'
     else
@@ -1860,7 +2234,7 @@ smart_sweep_preflight() {
     local -a interfaces=()
     SMART_SWEEP_REUSE_QUEUE=0
     for required in ip tc sysctl modprobe modinfo iperf3 jq timeout getent; do
-        command -v "$required" >/dev/null || die "智能扫描缺少 $required；先安装 apt-get install -y iproute2 procps kmod iperf3 jq coreutils，或选择仅基础调优。"
+        command -v "$required" >/dev/null || die "隔离扫描环境缺少 $required；工具准备未完成，未更改调优配置。"
     done
     available=$(sysctl -n net.ipv4.tcp_available_congestion_control)
     if [[ " $available " != *' bbr '* ]] && ! modinfo tcp_bbr >/dev/null 2>&1; then
@@ -2061,6 +2435,10 @@ shape_put_fq() {
 
 shape_put_rate() {
     local iface=$1 rate=$2 burst
+    # Kernel module autoload normally invokes the host /sbin/modprobe. When
+    # kmod is isolated, load explicitly through the selected runtime instead.
+    modprobe sch_htb || return 1
+    modprobe sch_fq || return 1
     burst=$((rate * 500)); ((burst >= 32768)) || burst=32768
     # Recreate the tree, including its fq leaf, with identical defaults for
     # every test and final deployment. Omitted options must not leak across runs.
@@ -2158,8 +2536,8 @@ shape_write_service() {
         printf '#!/usr/bin/env bash\nset -Eeuo pipefail\nexport LC_ALL=C\nexport PATH=/usr/sbin:/usr/bin:/sbin:/bin\n'
         printf 'STATE=%q\nSHAPE_IFACE=%q\nSHAPE_RATE=%q\n' "$STATE" "$SHAPE_IFACE" "$SHAPE_RATE"
         printf 'warn() { printf "%%s\\n" "$*" >&2; }\ndie() { warn "$*"; exit 1; }\n'
-        for name in shape_signature shape_filter_guard shape_put_fq shape_put_rate shape_verify_rate shape_service_restore shape_service_start; do declare -f "$name"; done
-        printf 'exec 9>/run/lock/vps-tune.lock\nflock -w 30 9 || die "vps-tune is busy"\nshape_service_start\n'
+        for name in isolated_tools_fingerprint activate_persistent_tools shape_signature shape_filter_guard shape_put_fq shape_put_rate shape_verify_rate shape_service_restore shape_service_start; do declare -f "$name"; done
+        printf 'exec 9>/run/lock/vps-tune.lock\nflock -w 30 9 || die "vps-tune is busy"\nactivate_persistent_tools\nshape_service_start\n'
     } | write_file /usr/local/sbin/vps-tune-shape
     # Execute through bash; write_file intentionally leaves a regular 0644 file.
     write_file /etc/systemd/system/vps-tune-shape.service <<'EOF'
@@ -2255,6 +2633,7 @@ shape_transaction_finish() {
         if ((persistence_restored)); then rm -rf -- "$SHAPE_PERSIST_BACKUP"; fi
     fi
     ((restored)) || printf '%s\n' "$SHAPE_BEFORE_SIGNATURE" >&2
+    [[ -z $TOOLS_STAGING ]] || rm -rf -- "$TOOLS_STAGING"
     exit "$rc"
 }
 
@@ -2431,12 +2810,8 @@ run_shape_action() (
     fi
     shape_require_owned "$SHAPE_IFACE"
     shape_owned_files_guard
-    init_state
-    SHAPE_BEFORE_SIGNATURE=$(shape_signature "$SHAPE_IFACE")
-    SHAPE_BEFORE_RATE=$SHAPE_ACTIVE_RATE
-    [[ $SHAPE_BEFORE_SIGNATURE != 'qdisc fq '* ]] || SHAPE_BEFORE_RATE=''
     if [[ $ACTION == sweep ]]; then
-        for required in iperf3 jq timeout getent; do command -v "$required" >/dev/null || die "sweep requires preinstalled $required; no packages are installed automatically"; done
+        for required in iperf3 jq timeout getent; do command -v "$required" >/dev/null || die "Isolated sweep environment is missing $required"; done
         # Resolve only the explicitly supplied peer; never select public peers.
         address=$(getent ahosts "$SWEEP_PEER" | awk 'NR==1 {print $1}') || die 'Cannot resolve the supplied peer'
         [[ -n $address ]] || die 'Cannot resolve the supplied peer'
@@ -2444,6 +2819,13 @@ run_shape_action() (
         iface=$(awk '{for(i=1;i<NF;i++)if($i=="dev"){print $(i+1);exit}}' <<< "$ipline")
         [[ $iface == "$SHAPE_IFACE" ]] || die 'Peer route differs from the managed interface; no traffic sent'
         SWEEP_ADDRESS=$address
+    fi
+    init_state
+    persist_scan_tools
+    SHAPE_BEFORE_SIGNATURE=$(shape_signature "$SHAPE_IFACE")
+    SHAPE_BEFORE_RATE=$SHAPE_ACTIVE_RATE
+    [[ $SHAPE_BEFORE_SIGNATURE != 'qdisc fq '* ]] || SHAPE_BEFORE_RATE=''
+    if [[ $ACTION == sweep ]]; then
         SHAPE_RESTORE=1
         shape_run_sweep
         if [[ -n $SMART_SWEEP_RESULT_FILE && -f $SHAPE_LOG_DIR/result.txt ]]; then
@@ -2483,6 +2865,7 @@ main() {
     fi
     parse_args "$@"
     check_os
+    activate_persistent_tools
     if ((QDISC_EXPLICIT == 0)); then QDISC=$(configured_qdisc); fi
     if [[ $ACTION == apply && -f $STATE/shaping/active && $QDISC != fq ]]; then
         die 'Active shaping needs the fq default; run shape --off before changing the base qdisc'
@@ -2494,6 +2877,13 @@ main() {
     ((EUID == 0)) || die 'Run as root'
     if [[ $ACTION == menu ]]; then interactive_menu; return; fi
     if [[ $ACTION == shape || $ACTION == sweep ]]; then
+        if [[ $ACTION == sweep && $DRY == 0 ]]; then
+            preflight
+            exec 9>/run/lock/vps-tune.lock
+            flock -n 9 || die 'Another vps-tune is running'
+            TUNE_LOCK_HELD=1
+            prepare_scan_tools
+        fi
         run_shape_action
         return
     fi
@@ -2550,8 +2940,12 @@ main() {
     if ((REVIEW)); then
         if ! review_tuning_plan; then log '预览结束，未写入调优配置。'; return; fi
     fi
-    if ((SMART_SWEEP)); then smart_sweep_preflight; fi
+    if ((SMART_SWEEP)); then
+        prepare_scan_tools
+        smart_sweep_preflight
+    fi
     init_state
+    persist_scan_tools
     if ! command -v sysctl >/dev/null || ! command -v modprobe >/dev/null || ! command -v tc >/dev/null; then
         apt_update
         apt_install procps kmod iproute2

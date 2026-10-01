@@ -201,6 +201,9 @@ setup_finish() {
         printf '%s\n' "$BBR_VALUE"
     }
     ensure_tmp() { mkdir -p "$TMP"; }
+    prepare_scan_tools() { :; }
+    persist_scan_tools() { :; }
+    activate_persistent_tools() { :; }
     smart_sweep_preflight() { :; }
     switch_queue() {
         [[ $ACTION == queue && $QDISC == fq && $TUNE_LOCK_HELD == 1 ]] || return 71
@@ -310,6 +313,7 @@ test_sweep_reuses_held_lock() {
     preflight() { :; }
     init_state() { :; }
     shape_read_active() { SHAPE_ACTIVE_IFACE=; SHAPE_ACTIVE_RATE=; }
+    persist_scan_tools() { :; }
     shape_require_owned() { :; }
     shape_owned_files_guard() { :; }
     shape_signature() { printf 'qdisc fq 7a00: root limit 10000p\n'; }
@@ -331,6 +335,8 @@ setup_main() {
     FIXTURE=valid
     TUNE_LOCK_HELD=0; SMART_BASE_APPLIED=0
     SWEEP_NOMINAL=''
+    prepare_scan_tools() { printf 'prepare-tools\n' >> "$EVENTS"; }
+    persist_scan_tools() { printf 'persist-tools\n' >> "$EVENTS"; }
     check_os() { VERSION_ID=13; CODENAME=trixie; }
     configured_qdisc() { printf 'cake\n'; }
     is_container() { return 1; }
@@ -379,7 +385,7 @@ test_main_sequence() {
     ((EUID == 0)) || { printf 'Full main requires Linux root; covered by container run\n'; return 0; }
     setup_main
     main "${SMART_ARGS[@]}" --apply-suggested-shape
-    assert_eq "$(cat "$EVENTS")" $'scan-preflight\ninit-state\nkernel:skip\nlimits\nnetwork:fq\nruntime\nscan-preflight\nqueue\nsweep\nshape:514\ncomplete'
+    assert_eq "$(cat "$EVENTS")" $'prepare-tools\nscan-preflight\ninit-state\npersist-tools\nkernel:skip\nlimits\nnetwork:fq\nruntime\nscan-preflight\nqueue\nsweep\nshape:514\ncomplete'
 }
 
 setup_menu() {
@@ -506,6 +512,7 @@ test_real_queue_workflow() {
     tc qdisc replace dev test0 root fq_codel
     preflight() { :; }
     is_container() { return 1; }
+    prepare_scan_tools() { :; }
     modprobe() { :; }
     modinfo() { :; }
     getent() { printf '192.0.2.1 STREAM peer\n'; }

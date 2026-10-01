@@ -9,6 +9,7 @@ SCRIPT=${1:?script path required}
 # shellcheck source=/dev/null
 source "$SCRIPT"
 trap - EXIT ERR INT TERM
+modprobe() { :; }
 STATE=$(mktemp -d)
 trap 'rm -rf -- "$STATE"' EXIT
 ip link add test0 type dummy
@@ -32,7 +33,6 @@ done
 tc qdisc change dev test0 root handle 7a00: fq limit 9999
 if (shape_require_owned test0); then echo 'Ownership accepted changed fq parameters' >&2; exit 1; fi
 # Explicit queue fq must rebuild default parameters before recording ownership.
-modprobe() { :; }
 sysctl() { [[ $1 != -n ]] || printf 'fq\n'; }
 QDISC=fq
 SYSCTL="$STATE/test-sysctl.conf"
