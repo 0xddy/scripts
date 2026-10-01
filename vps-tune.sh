@@ -11,7 +11,7 @@ SYSCTL=/etc/sysctl.d/99-zz-vps-tune.conf
 KEYRING=/etc/apt/keyrings/vps-tune-xanmod.gpg
 ACTION=apply
 KERNEL=lts
-QDISC=cake
+QDISC=fq
 QDISC_EXPLICIT=0
 CPU=auto
 NOFILE=1048576
@@ -33,6 +33,9 @@ ACCEPT_SPEEDTEST=0
 BANDWIDTH_SOURCE=manual
 DOWNLOAD_MBPS=
 SMART_CAP_MIB=
+PAGE_SIZE=
+TCP_MEM=
+BUFFER_CAP_MIB=
 SMART_WANTED_MIB=
 SMART_BDP_MIB=
 SMART_AUTO_MIB=
@@ -47,6 +50,11 @@ SPEEDTEST_PING=
 SPEEDTEST_JITTER=
 SPEEDTEST_LOSS=
 SPEEDTEST_SERVER=
+SHAPE_RATE=
+SHAPE_OFF=0
+SWEEP_PEER=
+SWEEP_NOMINAL=
+ACCEPT_TRAFFIC=0
 
 ui_text() {
     local tone=$1 value=$2 code=
@@ -116,13 +124,14 @@ trap 'on_error "$?" "$LINENO"' ERR
 usage() {
     cat <<'EOF'
 Usage: bash vps-tune.sh                    # Chinese interactive menu
-       bash vps-tune.sh [menu|apply|check|rollback|measure|queue] [options]
+       bash vps-tune.sh [menu|apply|check|rollback|measure|queue|shape|sweep] [options]
   --review                Show the calculated plan, then ask apply/preview/cancel.
   --kernel lts|main|skip    Default: lts. Debian 12 supports LTS only.
-  --qdisc cake|fq|fq_codel Required for queue: change only the egress discipline.
+  --qdisc cake|fq|fq_codel Apply default, or queue: switch the live discipline.
+                          New installations default to fq; saved choices persist.
   --cpu-level auto|v1|v2|v3  Auto chooses the level supported by EVERY CPU.
   --nofile NUMBER          Global soft/hard limit; 65536..1048576.
-  --buffer-mib auto|4|8|16|32|64  Per-socket maximum, not initial allocation.
+  --buffer-mib auto|NUMBER Per-direction ceiling, 4..256 MiB, within RAM budget.
   --smart-bandwidth        Opt in to bandwidth-aware buffers (default: BDP).
   --smart-profile bdp|asia-bdp|overseas-bdp|asia|overseas
                           Region BDP: planning RTT 100/200ms. asia/overseas: tables.
@@ -132,6 +141,13 @@ Usage: bash vps-tune.sh                    # Chinese interactive menu
   --speedtest-json FILE    Import an existing Ookla JSON result (bytes/sec).
   --speedtest              Run a temporary isolated official Ookla CLI once.
   --accept-speedtest-terms Explicitly accept Ookla license/GDPR for this run.
+  shape --rate-mbps NUMBER Apply an aggregate egress cap with HTB + fq.
+  shape --off             Remove owned shaping; keep base tuning and fq.
+  sweep --peer HOST --nominal-mbps NUMBER --accept-traffic
+                          Explicit iperf3 scan; prints a recommendation only.
+                          Requires iperf3/jq, a server on TCP 5201, and a known
+                          single-root fq baseline from queue --qdisc fq.
+                          Scanning temporarily affects the entire egress NIC.
   --reboot                Reboot after a successful apply (disconnects SSH).
   --allow-dkms            Proceed despite detected DKMS modules.
   --dry-run               Read-only plan. Does not fetch or install packages.
@@ -154,8 +170,8 @@ EOF
 parse_args() {
     while (($#)); do
         case $1 in
-            menu|apply|check|rollback|measure|queue) ACTION=$1; shift ;;
-            --kernel|--cpu-level|--nofile|--buffer-mib|--smart-profile|--bandwidth-mbps|--rtt-ms|--speedtest-json|--qdisc)
+            menu|apply|check|rollback|measure|queue|shape|sweep) ACTION=$1; shift ;;
+            --kernel|--cpu-level|--nofile|--buffer-mib|--smart-profile|--bandwidth-mbps|--rtt-ms|--speedtest-json|--qdisc|--rate-mbps|--peer|--nominal-mbps)
                 (($# >= 2)) || die "Missing value for $1"
                 case $1 in
                     --kernel) KERNEL=$2 ;; --cpu-level) CPU=$2 ;;
@@ -165,6 +181,9 @@ parse_args() {
                     --rtt-ms) RTT_MS=$2 ;;
                     --speedtest-json) SPEEDTEST_JSON=$2 ;;
                     --qdisc) QDISC=$2; QDISC_EXPLICIT=1 ;;
+                    --rate-mbps) SHAPE_RATE=$2 ;;
+                    --peer) SWEEP_PEER=$2 ;;
+                    --nominal-mbps) SWEEP_NOMINAL=$2 ;;
                 esac
                 shift 2 ;;
             --reboot) REBOOT=1; shift ;;
@@ -176,6 +195,8 @@ parse_args() {
             --accept-speedtest-terms) ACCEPT_SPEEDTEST=1; shift ;;
             --container-test) TEST=1; shift ;;
             --dry-run) DRY=1; shift ;;
+            --off) SHAPE_OFF=1; shift ;;
+            --accept-traffic) ACCEPT_TRAFFIC=1; shift ;;
             -h|--help) usage; exit 0 ;;
             *) die "Unknown argument: $1" ;;
         esac
@@ -183,12 +204,14 @@ parse_args() {
     [[ $KERNEL =~ ^(lts|main|skip)$ ]] || die 'Invalid --kernel'
     [[ $CPU =~ ^(auto|v1|v2|v3)$ ]] || die 'Invalid --cpu-level'
     if [[ ! $NOFILE =~ ^[1-9][0-9]{4,6}$ ]] || ((NOFILE < 65536 || NOFILE > 1048576)); then die 'Invalid --nofile'; fi
-    [[ $BUFFER =~ ^(auto|4|8|16|32|64)$ ]] || die 'Invalid --buffer-mib'
+    if [[ $BUFFER != auto ]]; then
+        if [[ ! $BUFFER =~ ^[1-9][0-9]{0,2}$ ]] || ((BUFFER < 4 || BUFFER > 256)); then die 'Invalid --buffer-mib: use auto or 4..256'; fi
+    fi
     [[ $QDISC =~ ^(cake|fq|fq_codel)$ ]] || die 'Invalid --qdisc'
     if [[ $ACTION == queue ]]; then
         ((QDISC_EXPLICIT)) || die 'queue requires --qdisc cake|fq|fq_codel'
         KERNEL=skip
-    elif ((QDISC_EXPLICIT)); then die '--qdisc is only for the queue action'; fi
+    elif ((QDISC_EXPLICIT)) && [[ $ACTION != apply ]]; then die '--qdisc is only for apply/queue'; fi
     if ((TEST && REBOOT)); then die 'Container tests cannot reboot'; fi
     if [[ $ACTION != apply ]] && ((REBOOT)); then die 'Reboot flag requires apply'; fi
     if ((REVIEW)) && [[ $ACTION != apply ]]; then die '--review requires apply'; fi
@@ -197,6 +220,7 @@ parse_args() {
         SMART=1; SPEEDTEST=1; SMART_PROFILE=asia
     fi
     validate_smart_args
+    validate_shape_args
 }
 
 valid_positive() {
@@ -239,20 +263,31 @@ validate_smart_args() {
     fi
 }
 
-# Independent implementation inspired by Actions-bbr-v3's bandwidth/region
-# tables; BDP profiles also use RTT and apply conservative memory ceilings.
-# Input/output units: RAM MiB -> maximum per-socket buffer MiB.
+# Independently implemented from tcpfit's BDP/budget approach (reference main
+# 76331588af487a973d3445a1bf8bba7037d566ca). tcp_mem is measured in PAGES,
+# socket limits in BYTES. This is a planning heuristic, not an OOM guarantee:
+# application buffers, UDP and kernel allocations consume additional memory.
+tcp_memory_plan() {
+    local memory=$1 page=$2
+    awk -v memory="$memory" -v page="$page" 'BEGIN {
+        pages=int(memory*1048576/page);
+        printf "%.0f %.0f %.0f\n", int(pages/16), int(pages/8), int(pages/4);
+    }'
+}
+
 smart_memory_cap_mib() {
-    local memory=$1
-    if ((memory < 512)); then echo 4
-    elif ((memory < 1024)); then echo 8
-    elif ((memory < 2048)); then echo 16
-    elif ((memory < 4096)); then echo 32
-    else echo 64; fi
+    local memory=$1 cap
+    local -a pages=()
+    read -r -a pages < <(tcp_memory_plan "$memory" "${PAGE_SIZE:-4096}")
+    cap=$((pages[2] * ${PAGE_SIZE:-4096} / 8 / 1048576))
+    ((cap <= 256)) || cap=256
+    # Do not apply a 4 MiB floor after the memory cap: that would defeat the
+    # budget on tiny machines. choose_plan rejects unusably small budgets.
+    printf '%s\n' "$cap"
 }
 
 # Emits: chosen_MiB memory_cap_MiB wanted_MiB BDP_MiB.
-# 2 x BDP plus upward tier rounding is a starting heuristic, not an optimum.
+# Ceil to whole MiB; retain the old region tables as explicit legacy profiles.
 smart_buffer_plan() {
     local bandwidth=$1 rtt=${2:-0} profile=$3 memory=$4 cap
     cap=$(smart_memory_cap_mib "$memory")
@@ -260,9 +295,9 @@ smart_buffer_plan() {
     BEGIN {
         bdp=bw*1000000/8*rtt/1000/1048576;
         if (mode=="bdp" || mode=="asia-bdp" || mode=="overseas-bdp") {
-            n=split("4 8 12 16 24 32 48 64", tiers, " ");
-            wanted=int(2*bdp); if (wanted<2*bdp) wanted++;
-            for (i=1;i<=n;i++) if (tiers[i]>=2*bdp) {wanted=tiers[i]; break}
+            target=2*bdp+2;
+            wanted=int(target); if(wanted<target) wanted++;
+            if(wanted<4) wanted=4;
         } else if (mode=="asia") {
             wanted=(bw<500 ? 8 : bw<1000 ? 12 : bw<2000 ? 16 : bw<5000 ? 24 : bw<10000 ? 28 : 32);
         } else {
@@ -600,6 +635,11 @@ cpu_level() {
 
 choose_plan() {
     MEM_MIB=$(awk '/MemTotal:/ {print int($2/1024)}' /proc/meminfo)
+    PAGE_SIZE=$(getconf PAGESIZE)
+    [[ $MEM_MIB =~ ^[1-9][0-9]*$ && $PAGE_SIZE =~ ^[1-9][0-9]*$ ]] || die 'Cannot determine RAM/page size'
+    TCP_MEM=$(tcp_memory_plan "$MEM_MIB" "$PAGE_SIZE")
+    BUFFER_CAP_MIB=$(smart_memory_cap_mib "$MEM_MIB")
+    ((BUFFER_CAP_MIB >= 1)) || die 'Insufficient RAM for the TCP memory budget'
     if ((SMART)); then
         read -r BUFFER SMART_CAP_MIB SMART_WANTED_MIB SMART_BDP_MIB < <(smart_buffer_plan "$BANDWIDTH" "$RTT_MS" "$SMART_PROFILE" "$MEM_MIB")
         SMART_AUTO_MIB=$BUFFER
@@ -609,6 +649,9 @@ choose_plan() {
         ((MEM_MIB < 1024)) || BUFFER=8
         ((MEM_MIB < 2048)) || BUFFER=16
         ((MEM_MIB < 4096)) || BUFFER=32
+        ((BUFFER <= BUFFER_CAP_MIB)) || BUFFER=$BUFFER_CAP_MIB
+    elif ((BUFFER > BUFFER_CAP_MIB)); then
+        die "Manual buffer ${BUFFER} MiB exceeds TCP budget cap ${BUFFER_CAP_MIB} MiB"
     fi
     BUF_BYTES=$((BUFFER * 1024 * 1024))
     FS_MAX=$(cat /proc/sys/fs/file-max)
@@ -661,13 +704,16 @@ preflight() {
 }
 
 init_state() {
-    install -d -m 700 "$STATE" "$STATE/original" "$STATE/expected"
+    install -d -m 700 "$STATE" "$STATE/original" "$STATE/expected" "$STATE/expected-absent"
     touch "$STATE/manifest" "$STATE/runtime.before"
 }
 
 track_file() {
     local path=$1
     if grep -Fxq "$path" "$STATE/manifest"; then
+        if [[ -f $STATE/expected-absent$path && ( -e $path || -L $path ) ]]; then
+            die "Managed path recreated externally after rollback: $path; reconcile before retrying"
+        fi
         if [[ -f $STATE/expected$path ]]; then
             if [[ ! -f $path || -L $path ]] || ! cmp -s "$path" "$STATE/expected$path"; then die "Managed file changed externally: $path; back it up/reconcile before reapplying or rolling back"; fi
         fi
@@ -691,6 +737,7 @@ write_file() {
     chmod 644 "$tmpfile"
     mv -f -- "$tmpfile" "$path"
     cp -- "$path" "$STATE/expected$path"
+    rm -f -- "$STATE/expected-absent$path"
 }
 
 apt_update() { apt-get -o Acquire::Retries=3 -o APT::Update::Error-Mode=any update; }
@@ -817,25 +864,34 @@ configured_qdisc() {
     selected=$(awk -F= '/^[[:space:]]*-?net\.core\.default_qdisc[[:space:]]*=/ {
         value=$2; sub(/#.*/, "", value); gsub(/[[:space:]]/, "", value)
     } END {print value}' "$SYSCTL" 2>/dev/null) || selected=
-    case $selected in cake|fq|fq_codel) printf '%s' "$selected" ;; *) printf cake ;; esac
+    case $selected in cake|fq|fq_codel) printf '%s' "$selected" ;; *) printf fq ;; esac
 }
 
 configure_network() {
+    local backlog=8192 listen=4096
+    ((MEM_MIB < 1024)) || backlog=16384
+    ((MEM_MIB < 512)) || listen=8192
     write_file "$SYSCTL" <<EOF
 # Managed by vps-tune. Values are ceilings, not preallocated buffers.
 # Buffer plan: $(buffer_plan_description)
 fs.file-max = $FS_MAX
 fs.nr_open = $NR_OPEN
-net.core.somaxconn = 4096
-net.ipv4.tcp_max_syn_backlog = 8192
-net.core.netdev_max_backlog = 8192
+net.core.somaxconn = $listen
+net.ipv4.tcp_max_syn_backlog = $backlog
+net.core.netdev_max_backlog = $backlog
 net.core.rmem_max = $BUF_BYTES
 net.core.wmem_max = $BUF_BYTES
 net.ipv4.tcp_rmem = 4096 131072 $BUF_BYTES
 net.ipv4.tcp_wmem = 4096 16384 $BUF_BYTES
+# Global TCP queue budget: RAM 1/16, 1/8, 1/4 in actual kernel pages.
+net.ipv4.tcp_mem = $TCP_MEM
 net.ipv4.tcp_moderate_rcvbuf = 1
 net.ipv4.tcp_window_scaling = 1
 net.ipv4.tcp_sack = 1
+net.ipv4.tcp_dsack = 1
+net.ipv4.tcp_timestamps = 1
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_no_metrics_save = 0
 net.ipv4.tcp_syncookies = 1
 net.ipv4.tcp_mtu_probing = 1
 # Optional until the new kernel boots. The sysctl algorithm name is bbr,
@@ -859,7 +915,7 @@ buffer_plan_description() {
         printf 'smart/%s; source=%s; upload/target=%s Mbit/s; download=%s Mbit/s; RTT=%s ms; RTT-basis=%s; BDP=%s MiB; wanted=%s MiB; RAM-cap=%s MiB; selected=%s MiB; selection=%s; automatic=%s MiB' \
             "$SMART_PROFILE" "$BANDWIDTH_SOURCE" "$BANDWIDTH" "${DOWNLOAD_MBPS:-not-measured}" "${RTT_MS:-not-used}" "$basis" "$SMART_BDP_MIB" "$SMART_WANTED_MIB" "$SMART_CAP_MIB" "$BUFFER" "$SMART_BUFFER_SOURCE" "$SMART_AUTO_MIB"
     else
-        printf 'standard; selected=%s MiB' "$BUFFER"
+        printf 'standard; selected=%s MiB; budget-cap=%s MiB' "$BUFFER" "$BUFFER_CAP_MIB"
     fi
 }
 
@@ -869,6 +925,7 @@ show_tuning_plan() {
     printf '  内核方案  %s\n' "${PACKAGE:-保留当前内核}"
     printf '  网络配置  BBR + %s\n' "${QDISC^^}"
     printf '  文件句柄  默认每进程上限 %s\n' "$NOFILE"
+    printf '  TCP 预算  %s 页（页大小 %s 字节；RAM 的 1/16、1/8、1/4）\n' "$TCP_MEM" "$PAGE_SIZE"
     printf '  缓冲上限  每个 TCP 连接的收/发缓冲各 %s MiB（按需使用）\n' "$BUFFER"
     if ((SMART)); then
         local basis='手动填写' profile='带宽与 RTT 计算'
@@ -908,6 +965,7 @@ show_buffer_notice() {
 set_smart_buffer() {
     local value=$1
     [[ $value =~ ^[1-9][0-9]{0,2}$ ]] && ((value >= 4 && value <= 256)) || return 1
+    ((value <= SMART_CAP_MIB)) || return 1
     BUFFER=$value
     BUF_BYTES=$((BUFFER * 1024 * 1024))
     SMART_BUFFER_SOURCE=manual
@@ -918,7 +976,7 @@ review_tuning_plan() {
         show_tuning_plan
         show_buffer_notice
         printf '\n1. 应用方案\n2. 仅预览，返回菜单\n'
-        if ((SMART)); then
+        if ((SMART && SMART_CAP_MIB >= 4)); then
             printf '3. 手动设置缓冲上限\n4. 恢复自动建议（%s MiB）\n' "$SMART_AUTO_MIB"
         fi
         printf '0. 取消\n'
@@ -928,11 +986,12 @@ review_tuning_plan() {
             0|2) return 1 ;;
             3)
                 ((SMART)) || { printf '无效选择。\n'; continue; }
+                ((SMART_CAP_MIB >= 4)) || { printf '本机预算不足 4 MiB，保留自动值。\n'; continue; }
                 while true; do
                     menu_read '输入缓冲上限（4～256 MiB，整数；回车保留）：' || return 1
                     [[ -n $REPLY ]] || break
                     if set_smart_buffer "$REPLY"; then break; fi
-                    printf '请输入 4～256 的整数，例如 32。\n'
+                    printf '请输入 4～256 的整数，且不超过本机预算 %s MiB。\n' "$SMART_CAP_MIB"
                 done ;;
             4)
                 ((SMART)) || { printf '无效选择。\n'; continue; }
@@ -1034,7 +1093,7 @@ switch_queue() {
             fi
             case $root in
                 cake|fq|fq_codel|pfifo_fast)
-                    if [[ $root != "$QDISC" ]]; then change_interfaces+=("$interface"); change_parents+=(root); fi ;;
+                    if [[ $root != "$QDISC" || $QDISC == fq ]]; then change_interfaces+=("$interface"); change_parents+=(root); fi ;;
                 mq)
                     leaves=0
                     while read -r kind parent; do
@@ -1069,6 +1128,16 @@ switch_queue() {
             interface=${change_interfaces[index]}; parent=${change_parents[index]}
             local -a attach=(root)
             [[ $parent == root ]] || attach=(parent "$parent")
+            # Explicit queue fq establishes a known, replayable baseline for
+            # optional shaping. Never mark arbitrary pre-existing fq as owned.
+            if [[ $parent == root && $QDISC == fq ]]; then
+                # replace with the same handle/type can keep old custom
+                # options. A different temporary handle forces recreation.
+                if ! grep -Eq '^qdisc fq 7a01: root' <<< "${snapshots[$interface]}"; then
+                    tc qdisc replace dev "$interface" root handle 7a01: fq || die 'Could not create a fresh fq baseline'
+                fi
+                attach+=(handle 7a00:)
+            fi
             if ! tc qdisc replace dev "$interface" "${attach[@]}" "$QDISC"; then
                 warn '切换未全部完成；已更改的队列保留当前状态，开机配置尚未更新。'
                 printf '当前队列：%s\n' "$(menu_qdisc_status)"
@@ -1083,6 +1152,12 @@ switch_queue() {
         [[ $current == "$QDISC" ]] || die '默认队列校验失败，未保存开机配置。'
     fi
     persist_queue_choice
+    if ((TEST == 0)); then
+        for interface in "${interfaces[@]}"; do
+            if [[ $QDISC == fq ]]; then shape_mark_fq "$interface"
+            else shape_forget_queue "$interface"; fi
+        done
+    fi
     if ((TEST)); then log '测试配置已保存；未修改运行中的网卡队列。'
     else
         log "已切换为 ${QDISC^^}，并保存开机配置。"
@@ -1101,6 +1176,10 @@ check_qdiscs() {
     if ((${#interfaces[@]} == 0)); then warn 'No default-route interface; queues are unverified'; return 2; fi
     for interface in "${interfaces[@]}"; do
         log "Actual egress qdisc: $interface"
+        if shape_is_active_interface "$interface"; then
+            shape_check_status || bad=1
+            continue
+        fi
         if ! output=$(tc qdisc show dev "$interface"); then bad=1; continue; fi
         printf '%s\n' "$output"
         # mq is a valid root when every transmit leaf matches. ingress/clsact
@@ -1153,6 +1232,7 @@ check_status() {
         bad=1
     fi
     check_qdiscs || bad=1
+    shape_check_status || bad=1
     log "Current shell limit: soft=$(ulimit -Sn), hard=$(ulimit -Hn). Re-login for PAM limits."
     if ((bad)); then warn 'CHECK: differences/pending/unverified items exist (exit 2)'; return 2; fi
     log 'CHECK: inspected runtime values and default-route queues match. Verify new login sessions separately.'
@@ -1160,24 +1240,43 @@ check_status() {
 
 rollback() {
     [[ -s $STATE/manifest ]] || die 'No tracked configuration to restore'
-    local path key value archived
+    local path key value archived failed=0
     while IFS= read -r path; do
+        if [[ -f $STATE/expected-absent$path && ( -e $path || -L $path ) ]]; then
+            die "Rollback would delete a later file: $path. Back it up/reconcile first"
+        fi
         if [[ -f $STATE/expected$path ]]; then
             if [[ ! -f $path || -L $path ]] || ! cmp -s "$path" "$STATE/expected$path"; then die "Rollback would overwrite a later edit: $path. Back it up/reconcile first"; fi
         fi
     done < "$STATE/manifest"
     ((DRY == 0)) || { log 'Would restore the following paths:'; cat "$STATE/manifest"; return 0; }
+    if ((TEST == 0)); then shape_rollback; fi
     while IFS= read -r path; do
         if [[ -f $STATE/original$path ]]; then cp -a -- "$STATE/original$path" "$path"; else rm -f -- "$path"; fi
+        # Keep rollback retryable if a later runtime/service/GRUB step fails.
+        if [[ -f $path ]]; then
+            cp -- "$path" "$STATE/expected$path"
+            rm -f -- "$STATE/expected-absent$path"
+        else
+            rm -f -- "$STATE/expected$path"
+            mkdir -p "$STATE/expected-absent$(dirname "$path")"
+            touch "$STATE/expected-absent$path"
+        fi
     done < "$STATE/manifest"
     if ((TEST == 0)); then
         while IFS='=' read -r key value; do
             [[ -n $key ]] || continue
-            sysctl -w "$key=$value" || warn "Could not restore live sysctl: $key; reboot and verify"
+            if ! sysctl -w "$key=$value"; then
+                warn "Could not restore live sysctl: $key; reboot and verify"
+                failed=1
+            fi
         done < "$STATE/runtime.before"
-        systemctl daemon-reload
-        systemctl daemon-reexec
-        if grep -qF '/etc/default/grub.d/90-vps-tune.cfg' "$STATE/manifest"; then update-grub; fi
+        systemctl daemon-reload || failed=1
+        systemctl daemon-reexec || failed=1
+        if grep -qF '/etc/default/grub.d/90-vps-tune.cfg' "$STATE/manifest"; then update-grub || failed=1; fi
+    fi
+    if ((failed)); then
+        die 'Persistent files restored, but live rollback is incomplete; backup retained for retry'
     fi
     archived="${STATE}.rolled-back.$(date +%Y%m%d%H%M%S).$$"
     mv -- "$STATE" "$archived"
@@ -1270,6 +1369,49 @@ menu_queue() {
     menu_run "${args[@]}"
 }
 
+menu_shape() {
+    print_heading '出口整形与测量（可选）'
+    printf '仅支持本脚本用菜单 8 建立的标准单根 FQ；不接管多队列或第三方整形。\n'
+    printf '整形影响整张出口网卡；扫描会临时切换队列并消耗真实流量。\n'
+    printf '1. 预览扫描计划\n2. 执行扫描（只输出建议）\n3. 手动设置整形速率\n4. 关闭本脚本整形，保留基础调优\n0. 返回\n'
+    local choice peer nominal rate
+    menu_read '请选择 [0]：' 0 || return 0
+    choice=$REPLY
+    case $choice in
+        1|2)
+            if [[ $choice == 2 ]] && { ((TEST)) || is_container; }; then
+                printf '容器测试不发起真实扫描。\n'; return 0
+            fi
+            menu_read '有权测试的 iperf3 对端主机/IP（端口 5201）：' || return 0
+            peer=$REPLY
+            [[ -n $peer ]] || return 0
+            menu_read '标称出口带宽（Mbit/s）：' || return 0
+            nominal=$REPLY
+            if [[ $choice == 1 ]]; then
+                menu_run sweep --peer "$peer" --nominal-mbps "$nominal" --dry-run
+            else
+                if ! bash "$SCRIPT_SELF" sweep --peer "$peer" --nominal-mbps "$nominal" --dry-run; then
+                    printf '预览未通过，请先处理上述问题。\n'; return 0
+                fi
+                menu_read '已了解上述流量和影响，输入 y 执行 [y/N]：' n || return 0
+                if [[ $REPLY == y || $REPLY == Y ]]; then
+                    menu_run sweep --peer "$peer" --nominal-mbps "$nominal" --accept-traffic
+                fi
+            fi ;;
+        3|4)
+            if ((TEST)) || is_container; then printf '容器测试不修改真实队列。\n'; return 0; fi
+            if [[ $choice == 4 ]]; then menu_run shape --off
+            else
+                menu_read '聚合出口速率（Mbit/s，采用扫描建议或手动测试值）：' || return 0
+                rate=$REPLY
+                [[ -n $rate ]] || return 0
+                menu_run shape --rate-mbps "$rate"
+            fi ;;
+        0) return 0 ;;
+        *) printf '无效选择。\n' ;;
+    esac
+}
+
 menu_settings() {
     while true; do
         printf '\n参数设置（仅本次菜单会话）\n'
@@ -1289,8 +1431,8 @@ menu_settings() {
                 menu_read 'CPU 等级：auto / v1 / v2 / v3：' auto || return 0
                 if [[ $REPLY =~ ^(auto|v1|v2|v3)$ ]]; then MENU_CPU=$REPLY; else printf '无效 CPU 等级。\n'; fi ;;
             4)
-                menu_read '常规缓冲档：auto / 4 / 8 / 16 / 32 / 64：' auto || return 0
-                if [[ $REPLY =~ ^(auto|4|8|16|32|64)$ ]]; then MENU_BUFFER=$REPLY; else printf '无效缓冲档位。\n'; fi ;;
+                menu_read '常规缓冲上限：auto 或 4～256 MiB 整数（仍受内存预算约束）：' auto || return 0
+                if [[ $REPLY == auto ]] || { [[ $REPLY =~ ^[1-9][0-9]{0,2}$ ]] && ((REPLY >= 4 && REPLY <= 256)); }; then MENU_BUFFER=$REPLY; else printf '无效缓冲上限。\n'; fi ;;
             5)
                 menu_read '已自行核实 DKMS 模块兼容性？允许继续输入 y [y/N]：' n || return 0
                 MENU_DKMS=0
@@ -1489,6 +1631,7 @@ interactive_menu() {
         menu_item 6 回滚配置 warning
         menu_item 7 参数设置
         menu_item 8 切换队列算法
+        menu_item 9 出口整形与扫描
         menu_item 0 退出 muted
         menu_read '请选择 [0]：' 0 || break
         case $REPLY in
@@ -1514,12 +1657,534 @@ interactive_menu() {
                 else printf '无法预览回滚，请查看上方原因。\n'; fi ;;
             7) menu_settings ;;
             8) menu_queue ;;
+            9) menu_shape ;;
             0) break ;;
-            *) printf '请选择 0～8。\n' ;;
+            *) printf '请选择 0～9。\n' ;;
         esac
     done
     printf '已退出菜单。\n'
 }
+
+# BEGIN OPTIONAL SHAPING
+#!/usr/bin/env bash
+# Optional shaping and bounded, single-stream experiments. Integration globals:
+# SHAPE_RATE= SHAPE_OFF=0 SWEEP_PEER= SWEEP_NOMINAL= ACCEPT_TRAFFIC=0
+# queue fq explicitly creates root handle 7a00: fq before shape_mark_fq.
+
+validate_shape_args() {
+    if [[ $ACTION != shape && $ACTION != sweep ]]; then
+        if [[ -n $SHAPE_RATE || -n $SWEEP_PEER || -n $SWEEP_NOMINAL ]] || ((SHAPE_OFF != 0 || ACCEPT_TRAFFIC != 0)); then die 'Shaping options require shape or sweep'; fi
+        return 0
+    fi
+    KERNEL=skip
+    ((TEST == 0)) || die 'shape/sweep are disabled in container-test'
+    if [[ $ACTION == shape ]]; then
+        if [[ -n $SWEEP_PEER || -n $SWEEP_NOMINAL ]] || ((ACCEPT_TRAFFIC != 0)); then die 'Peer/traffic options require sweep'; fi
+        if ((SHAPE_OFF)); then [[ -z $SHAPE_RATE ]] || die 'Choose --off OR --rate-mbps'
+        else
+            if [[ ! $SHAPE_RATE =~ ^[1-9][0-9]{0,5}$ ]] || ((SHAPE_RATE > 100000)); then die '--rate-mbps must be an integer, 1..100000'; fi
+        fi
+    else
+        if [[ -n $SHAPE_RATE ]] || ((SHAPE_OFF != 0)); then die 'sweep does not accept shape options'; fi
+        [[ $SWEEP_PEER =~ ^[a-zA-Z0-9][a-zA-Z0-9.:-]{0,252}$ ]] || die '--peer requires your own/authorized iperf3 host or IP (port 5201)'
+        if [[ ! $SWEEP_NOMINAL =~ ^[1-9][0-9]{0,4}$ ]] || ((SWEEP_NOMINAL > 10000)); then die '--nominal-mbps must be an integer, 1..10000'; fi
+        ((ACCEPT_TRAFFIC || DRY)) || die 'sweep sends real traffic; explicitly pass --accept-traffic'
+    fi
+}
+
+# tc's refcnt changes as links are referenced; it is not a tunable. Everything
+# else, including handles, fq options and class rates, remains in the signature.
+shape_signature() {
+    local iface=$1 q c
+    q=$(tc qdisc show dev "$iface") || return 1
+    c=$(tc class show dev "$iface") || return 1
+    printf '%s\n%s\n' "$q" "$c" | sed -E 's/ refcnt [0-9]+//g; s/ direct_packets_stat [0-9]+//g; /^[[:space:]]*$/d'
+}
+
+shape_filter_guard() {
+    local iface=$1 parent filters
+    # Only the flat fq or our two-qdisc tree is accepted. ingress/clsact and
+    # additional leaves change the signature and are rejected as well.
+    for parent in root 7a10: 7a10:1; do
+        if [[ $parent == root ]]; then filters=$(tc filter show dev "$iface" root) || return 1
+        else filters=$(tc filter show dev "$iface" parent "$parent") || return 1; fi
+        [[ -z $filters ]] || { warn "Filters exist on $iface/$parent; refusing to replace queues"; return 1; }
+    done
+}
+
+shape_mark_fq() {
+    local iface=$1 signature
+    [[ $iface =~ ^[a-zA-Z0-9_.:-]{1,15}$ && $iface != . && $iface != .. ]] || return 1
+    signature=$(shape_signature "$iface") || return 1
+    # Called only after an explicit queue fq has CREATED this standard queue.
+    [[ $signature == 'qdisc fq 7a00: root '* && $signature != *$'\n'* ]] || return 0
+    shape_filter_guard "$iface" || return 1
+    install -d -m 700 "$STATE/shaping"
+    printf '%s\n' "$signature" > "$STATE/shaping/fq.$iface"
+}
+
+shape_forget_queue() {
+    local iface=$1
+    [[ $iface =~ ^[a-zA-Z0-9_.:-]{1,15}$ && $iface != . && $iface != .. ]] || return 1
+    rm -f -- "$STATE/shaping/fq.$iface"
+}
+
+shape_read_active() {
+    SHAPE_ACTIVE_IFACE=; SHAPE_ACTIVE_RATE=
+    [[ -f $STATE/shaping/active ]] || return 0
+    read -r SHAPE_ACTIVE_IFACE SHAPE_ACTIVE_RATE < "$STATE/shaping/active" || return 1
+    [[ $SHAPE_ACTIVE_IFACE =~ ^[a-zA-Z0-9_.:-]{1,15}$ && $SHAPE_ACTIVE_IFACE != . && $SHAPE_ACTIVE_IFACE != .. && $SHAPE_ACTIVE_RATE =~ ^[1-9][0-9]{0,5}$ ]] && ((SHAPE_ACTIVE_RATE <= 100000))
+}
+
+shape_is_active_interface() {
+    shape_read_active || return 1
+    [[ -n $SHAPE_ACTIVE_IFACE && $SHAPE_ACTIVE_IFACE == "$1" ]]
+}
+
+shape_require_owned() {
+    local iface=$1 actual expected fq_expected boot_expected
+    [[ -f $STATE/shaping/fq.$iface ]] || die "No managed fq snapshot for $iface; first run queue --qdisc fq explicitly (single-root interfaces only)"
+    shape_filter_guard "$iface" || die 'Queue filters are not safely restorable'
+    actual=$(shape_signature "$iface") || die 'Cannot read current queues'
+    fq_expected=$(cat "$STATE/shaping/fq.$iface")
+    boot_expected=${fq_expected/qdisc fq 7a00: root/qdisc fq 0: root}
+    shape_read_active || die 'Invalid shaping state'
+    if [[ -n $SHAPE_ACTIVE_IFACE ]]; then
+        [[ $iface == "$SHAPE_ACTIVE_IFACE" ]] || die 'A different interface is already shaped; use shape --off first'
+        # Boot/service failures can leave the known fq intact while a persisted
+        # cap remains configured. Permit retry/off without guessing custom state.
+        if [[ $actual == "$fq_expected" ]]; then return 0; fi
+        if [[ $actual == "$boot_expected" ]]; then
+            [[ $(sysctl -n net.core.default_qdisc) == fq ]] || die 'Cannot safely restore kernel-created fq after changing its default'
+            return 0
+        fi
+        [[ -f $STATE/shaping/active.signature ]] || die 'Missing active queue signature'
+        expected=$(cat "$STATE/shaping/active.signature")
+    else expected=$fq_expected; fi
+    [[ $actual == "$expected" ]] || die 'Queue parameters/handles changed externally; refusing to replace or guess a restoration'
+}
+
+shape_put_fq() {
+    local iface=$1 actual expected=''
+    actual=$(shape_signature "$iface") || return 1
+    [[ ! -f $STATE/shaping/fq.$iface ]] || expected=$(cat "$STATE/shaping/fq.$iface")
+    if [[ $actual == 'qdisc fq 7a00: root '* ]]; then
+        # Some kernels reject in-place fq changes; others retain omitted
+        # parameters. Never treat a same-handle replace as a fresh fq.
+        [[ -n $expected && $actual == "$expected" ]] || return 1
+        return 0
+    fi
+    tc qdisc replace dev "$iface" root handle 7a00: fq || return 1
+    [[ -z $expected || $(shape_signature "$iface") == "$expected" ]]
+}
+
+shape_put_rate() {
+    local iface=$1 rate=$2 burst
+    burst=$((rate * 500)); ((burst >= 32768)) || burst=32768
+    # Recreate the tree, including its fq leaf, with identical defaults for
+    # every test and final deployment. Omitted options must not leak across runs.
+    shape_put_fq "$iface" || return 1
+    tc qdisc replace dev "$iface" root handle 7a10: htb default 1 || return 1
+    tc class replace dev "$iface" parent 7a10: classid 7a10:1 htb \
+        rate "${rate}mbit" ceil "${rate}mbit" burst "$burst" cburst "$burst" quantum 1514 || return 1
+    tc qdisc replace dev "$iface" parent 7a10:1 handle 7a11: fq maxrate "${rate}mbit" || return 1
+}
+
+shape_verify_rate() {
+    local iface=$1 rate=$2 q classes
+    q=$(tc qdisc show dev "$iface") || return 1
+    classes=$(tc class show dev "$iface") || return 1
+    # tc selects Kbit/Mbit/Gbit dynamically; compare normalized numbers.
+    awk '$1=="qdisc" {n++; if($2=="htb" && $3=="7a10:" && $4=="root") r++; if($2=="fq" && $3=="7a11:" && $4=="parent" && $5=="7a10:1") f++} END {exit !(n==2 && r==1 && f==1)}' <<< "$q" || return 1
+    awk -v wanted="$rate" '
+        function mbps(x, n) {n=x+0; if(x~/Gbit$/) return n*1000; if(x~/Mbit$/) return n; if(x~/Kbit$/) return n/1000; if(x~/bit$/) return n/1000000; return -1}
+        $1=="class" {n++; if($2!="htb" || $3!="7a10:1") bad=1; for(i=1;i<NF;i++) {if($i=="rate") rate=mbps($(i+1)); if($i=="ceil") ceil=mbps($(i+1))}}
+        END {exit !(n==1 && !bad && rate>=wanted*.99 && rate<=wanted*1.01 && ceil>=wanted*.99 && ceil<=wanted*1.01)}' <<< "$classes"
+}
+
+shape_restore_original() {
+    [[ $(shape_signature "$SHAPE_IFACE") != "$SHAPE_BEFORE_SIGNATURE" ]] || return 0
+    if [[ -n $SHAPE_BEFORE_RATE ]]; then shape_put_rate "$SHAPE_IFACE" "$SHAPE_BEFORE_RATE" || return 1
+    elif [[ $SHAPE_BEFORE_SIGNATURE == 'qdisc fq 0: root '* ]]; then
+        [[ $(sysctl -n net.core.default_qdisc) == fq ]] || return 1
+        tc qdisc del dev "$SHAPE_IFACE" root || return 1
+    else shape_put_fq "$SHAPE_IFACE" || return 1; fi
+    [[ $(shape_signature "$SHAPE_IFACE") == "$SHAPE_BEFORE_SIGNATURE" ]]
+}
+
+shape_owned_files_guard() {
+    local path
+    for path in /usr/local/sbin/vps-tune-shape /etc/systemd/system/vps-tune-shape.service; do
+        [[ ! -L $path ]] || die "Refusing symlink: $path"
+        if [[ -e $path ]]; then
+            if [[ ! -f $STATE/expected$path ]] || ! cmp -s "$path" "$STATE/expected$path"; then die "Existing/unmanaged shaping file: $path"; fi
+        fi
+    done
+    local link=/etc/systemd/system/multi-user.target.wants/vps-tune-shape.service
+    if [[ -e $link || -L $link ]]; then
+        [[ -L $link && $(readlink "$link") == /etc/systemd/system/vps-tune-shape.service ]] || die 'Unexpected shaping service enable link'
+    fi
+}
+
+# Used by the generated systemd helper. A kernel-created fq root after boot has
+# handle 0:. Accept it only when ALL remaining parameters match the owned fq
+# template; mq, custom/default-changed queues, classes and filters are rejected.
+shape_service_restore() {
+    local rc=$1
+    trap - EXIT ERR INT TERM HUP
+    if ((SHAPE_SERVICE_PENDING)); then
+        if [[ $SHAPE_SERVICE_BEFORE == 'qdisc fq 0: root '* ]]; then
+            tc qdisc del dev "$SHAPE_IFACE" root || rc=1
+        elif [[ $SHAPE_SERVICE_BEFORE == 'qdisc fq 7a00: root '* ]]; then
+            shape_put_fq "$SHAPE_IFACE" || rc=1
+        else shape_put_rate "$SHAPE_IFACE" "$SHAPE_RATE" || rc=1; fi
+        [[ $(shape_signature "$SHAPE_IFACE") == "$SHAPE_SERVICE_BEFORE" ]] || { warn 'Service could not restore its original queue; inspect tc'; rc=1; }
+    fi
+    exit "$rc"
+}
+
+shape_service_start() {
+    local actual expected boot_expected signature temporary
+    shape_filter_guard "$SHAPE_IFACE" || die 'Unsafe filters at shaping startup'
+    actual=$(shape_signature "$SHAPE_IFACE") || die 'Cannot inspect startup queues'
+    expected=$(cat "$STATE/shaping/fq.$SHAPE_IFACE") || die 'Missing fq ownership state'
+    boot_expected=${expected/qdisc fq 7a00: root/qdisc fq 0: root}
+    if [[ $actual != "$expected" && $actual != "$boot_expected" ]]; then
+        [[ -f $STATE/shaping/active.signature && $actual == "$(cat "$STATE/shaping/active.signature")" ]] || die 'Startup queue differs from owned fq/HTB; left untouched'
+    fi
+    # Deleting a newly installed tree can restore the kernel's handle-0 fq only
+    # while the default is still fq. Refuse before mutation if this changed.
+    if [[ $actual == "$boot_expected" ]]; then
+        [[ $(sysctl -n net.core.default_qdisc) == fq ]] || die 'Kernel fq default changed; cannot safely restore boot queue'
+    fi
+    SHAPE_SERVICE_BEFORE=$actual; SHAPE_SERVICE_PENDING=1
+    trap 'shape_service_restore "$?"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    trap 'exit 129' HUP
+    shape_put_rate "$SHAPE_IFACE" "$SHAPE_RATE" || die 'Shaping service could not install HTB/fq'
+    shape_verify_rate "$SHAPE_IFACE" "$SHAPE_RATE" || die 'Shaping service could not verify its rate'
+    signature=$(shape_signature "$SHAPE_IFACE") || die 'Cannot read applied shaping signature'
+    temporary=$(mktemp "$STATE/shaping/.active-signature.XXXXXX") || die 'Cannot stage shaping signature'
+    printf '%s\n' "$signature" > "$temporary" || { rm -f -- "$temporary"; die 'Cannot write shaping signature'; }
+    mv -f -- "$temporary" "$STATE/shaping/active.signature" || die 'Cannot commit shaping signature'
+    SHAPE_SERVICE_PENDING=0
+}
+
+shape_write_service() {
+    local name
+    {
+        printf '#!/usr/bin/env bash\nset -Eeuo pipefail\nexport LC_ALL=C\nexport PATH=/usr/sbin:/usr/bin:/sbin:/bin\n'
+        printf 'STATE=%q\nSHAPE_IFACE=%q\nSHAPE_RATE=%q\n' "$STATE" "$SHAPE_IFACE" "$SHAPE_RATE"
+        printf 'warn() { printf "%%s\\n" "$*" >&2; }\ndie() { warn "$*"; exit 1; }\n'
+        for name in shape_signature shape_filter_guard shape_put_fq shape_put_rate shape_verify_rate shape_service_restore shape_service_start; do declare -f "$name"; done
+        printf 'exec 9>/run/lock/vps-tune.lock\nflock -w 30 9 || die "vps-tune is busy"\nshape_service_start\n'
+    } | write_file /usr/local/sbin/vps-tune-shape
+    # Execute through bash; write_file intentionally leaves a regular 0644 file.
+    write_file /etc/systemd/system/vps-tune-shape.service <<'EOF'
+[Unit]
+Description=VPS tune owned HTB and fq egress shaping
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/var/lib/vps-tune/shaping/active
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash /usr/local/sbin/vps-tune-shape
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+shape_check_status() {
+    shape_read_active || { warn 'Invalid shaping state'; return 2; }
+    [[ -n $SHAPE_ACTIVE_IFACE ]] || return 0
+    local actual
+    actual=$(shape_signature "$SHAPE_ACTIVE_IFACE") || return 2
+    if [[ ! -f $STATE/shaping/active.signature || $actual != "$(cat "$STATE/shaping/active.signature")" ]] || ! shape_filter_guard "$SHAPE_ACTIVE_IFACE" || ! shape_verify_rate "$SHAPE_ACTIVE_IFACE" "$SHAPE_ACTIVE_RATE"; then
+        warn 'Managed shaping does not match its saved rate/queue parameters'; return 2
+    fi
+    if ! systemctl is-enabled --quiet vps-tune-shape.service; then warn 'Shaping works now but its boot service is disabled'; return 2; fi
+    log "Managed HTB ${SHAPE_ACTIVE_RATE} Mbit/s + fq on $SHAPE_ACTIVE_IFACE"
+}
+
+# Back up only this feature's two regular files and active state. Original
+# file snapshots remain in the normal manifest for the global rollback.
+shape_backup_persistence() {
+    local path backup
+    backup=$(mktemp -d "$STATE/shaping/.transaction.XXXXXX")
+    for path in /usr/local/sbin/vps-tune-shape /etc/systemd/system/vps-tune-shape.service; do
+        if [[ -f $path ]]; then mkdir -p "$backup$(dirname "$path")"; cp -a -- "$path" "$backup$path"; fi
+    done
+    if systemctl is-enabled --quiet vps-tune-shape.service 2>/dev/null; then SHAPE_WAS_ENABLED=1; else SHAPE_WAS_ENABLED=0; fi
+    [[ ! -f $STATE/shaping/active ]] || cp -- "$STATE/shaping/active" "$backup/active"
+    [[ ! -f $STATE/shaping/active.signature ]] || cp -- "$STATE/shaping/active.signature" "$backup/active.signature"
+    SHAPE_PERSIST_BACKUP=$backup
+}
+
+shape_restore_persistence() {
+    local path item failed=0
+    for path in /usr/local/sbin/vps-tune-shape /etc/systemd/system/vps-tune-shape.service; do
+        if [[ -f $SHAPE_PERSIST_BACKUP$path ]]; then
+            cp -a -- "$SHAPE_PERSIST_BACKUP$path" "$path" || failed=1
+            cp -- "$SHAPE_PERSIST_BACKUP$path" "$STATE/expected$path" || failed=1
+            rm -f -- "$STATE/expected-absent$path" || failed=1
+        else
+            rm -f -- "$path" "$STATE/expected$path" || failed=1
+            mkdir -p "$STATE/expected-absent$(dirname "$path")" || failed=1
+            touch "$STATE/expected-absent$path" || failed=1
+        fi
+    done
+    for item in active active.signature; do
+        if [[ -f $SHAPE_PERSIST_BACKUP/$item ]]; then cp -- "$SHAPE_PERSIST_BACKUP/$item" "$STATE/shaping/$item" || failed=1
+        else rm -f -- "$STATE/shaping/$item" || failed=1; fi
+    done
+    systemctl daemon-reload || failed=1
+    if ((SHAPE_WAS_ENABLED)); then systemctl enable vps-tune-shape.service || failed=1
+    elif [[ -f /etc/systemd/system/vps-tune-shape.service ]]; then systemctl disable vps-tune-shape.service || failed=1
+    else
+        # disable may return an error after restoring an originally absent unit;
+        # its only owned enable link is safe to remove directly in that case.
+        rm -f -- /etc/systemd/system/multi-user.target.wants/vps-tune-shape.service || failed=1
+    fi
+    ((failed == 0))
+}
+
+shape_transaction_finish() {
+    local rc=$1 restored=1 persistence_restored=1
+    trap - EXIT ERR INT TERM HUP
+    # A background timeout plus wait lets Bash run signal traps immediately.
+    # GNU timeout owns its process group and forwards TERM to iperf3; its
+    # --kill-after=2 also bounds shutdown if the client ignores termination.
+    if [[ -n ${SHAPE_IPERF_PID:-} ]]; then
+        kill -TERM -- "-$SHAPE_IPERF_PID" 2>/dev/null || kill -TERM "$SHAPE_IPERF_PID" 2>/dev/null || true
+        wait "$SHAPE_IPERF_PID" 2>/dev/null || true
+        SHAPE_IPERF_PID=''
+    fi
+    if ((SHAPE_RESTORE)); then
+        if shape_restore_original; then log 'Restored the pre-experiment queue, including its handle and parameters'
+        else warn 'Queue restoration failed; inspect tc and the saved signature before resuming workloads'; restored=0; rc=1; fi
+    fi
+    if [[ -n $SHAPE_PERSIST_BACKUP ]]; then
+        if ((rc != 0)); then
+            shape_restore_persistence || { warn "Could not fully restore shaping persistence; recovery files retained: $SHAPE_PERSIST_BACKUP"; persistence_restored=0; rc=1; }
+        fi
+        if ((persistence_restored)); then rm -rf -- "$SHAPE_PERSIST_BACKUP"; fi
+    fi
+    ((restored)) || printf '%s\n' "$SHAPE_BEFORE_SIGNATURE" >&2
+    exit "$rc"
+}
+
+# One TCP stream, sender-side retransmissions divided by estimated segment
+# count from sent bytes / reported MSS. This is NOT packet-loss probability.
+shape_sample() {
+    local label=$1 rate=$2 file values rc
+    ((SHAPE_SAMPLE_COUNT < 28)) || die 'Experiment stopped at its 28-sample budget'
+    SHAPE_SAMPLE_COUNT=$((SHAPE_SAMPLE_COUNT + 1))
+    file="$SHAPE_LOG_DIR/$(printf '%02d' "$SHAPE_SAMPLE_COUNT")-$label.json"
+    timeout --signal=TERM --kill-after=2 22 iperf3 --client "$SWEEP_ADDRESS" --bind-dev "$SHAPE_IFACE" \
+        --port 5201 --parallel 1 --time 8 --omit 2 --connect-timeout 5000 --json > "$file" 2> "$file.stderr" &
+    SHAPE_IPERF_PID=$!
+    if wait "$SHAPE_IPERF_PID"; then rc=0; else rc=$?; fi
+    SHAPE_IPERF_PID=''
+    ((rc == 0)) || die "iperf3 failed or timed out (exit $rc); retained diagnostics in $file"
+    values=$(jq -er '
+        if .error then error(.error) else . end |
+        [.end.sum_sent.bytes, .end.sum_sent.retransmits, .end.sum_received.bits_per_second, .start.tcp_mss_default] |
+        if (all(.[]; type == "number")) and .[0]>0 and .[1]>=0 and .[2]>0 and .[3]>=256 and .[3]<=65535
+        then @tsv else error("Missing or invalid TCP bytes/retransmits/receiver goodput/MSS") end' "$file") || die "Unsupported/incomplete iperf3 JSON: $file"
+    local bytes retrans recv mss
+    IFS=$'\t' read -r bytes retrans recv mss <<< "$values"
+    read -r SHAPE_SAMPLE_GOODPUT SHAPE_SAMPLE_RATIO < <(awk -v b="$bytes" -v r="$retrans" -v g="$recv" -v m="$mss" 'BEGIN {printf "%.4f %.6f\n",g/1000000,100*r*m/b}')
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$label" "$rate" "$SHAPE_SAMPLE_GOODPUT" "$retrans" "$SHAPE_SAMPLE_RATIO" "$bytes" "$mss" >> "$SHAPE_LOG_DIR/samples.tsv"
+    log "$label: cap=${rate} Mbit/s, received=${SHAPE_SAMPLE_GOODPUT} Mbit/s, retrans=$retrans, estimated retrans/segments=${SHAPE_SAMPLE_RATIO}%"
+}
+
+shape_clean_sample() { awk -v ratio="$SHAPE_SAMPLE_RATIO" 'BEGIN {exit !(ratio <= .1)}'; }
+
+shape_sweep_rate() {
+    local rate=$1 label=$2
+    shape_put_rate "$SHAPE_IFACE" "$rate" || die 'Cannot install temporary HTB/fq'
+    shape_verify_rate "$SHAPE_IFACE" "$rate" || die 'Temporary shaper verification failed'
+    sleep 2
+    shape_sample "$label" "$rate"
+    if shape_clean_sample; then
+        awk -v g="$SHAPE_SAMPLE_GOODPUT" -v r="$rate" 'BEGIN {exit !(g>=r*.7)}' || die 'Rate was not exercised (received <70%); peer, path or CPU capacity makes this experiment inconclusive'
+        return 0
+    fi
+    # A single excursion is not a stable boundary; require a second sample.
+    sleep 2
+    shape_sample "$label-repeat" "$rate"
+    if shape_clean_sample; then die 'Retransmission spike did not repeat; no stable recommendation'; fi
+    return 1
+}
+
+shape_run_sweep() {
+    local base_g base_r base2_g base2_r lo hi step rate clean=0 bad=0 candidate i midpoint final1_g final1_r final2_g final2_r compare_g compare_r
+    SHAPE_LOG_DIR="$STATE/sweeps/$(date +%Y%m%d-%H%M%S)-$$"
+    install -d -m 700 "$SHAPE_LOG_DIR"
+    printf 'label\tcap_mbps\treceived_mbps\tretransmissions\testimated_retrans_percent\tsent_bytes\tmss\n' > "$SHAPE_LOG_DIR/samples.tsv"
+    log "Single-stream experiment to $SWEEP_PEER ($SWEEP_ADDRESS):5201; samples: $SHAPE_LOG_DIR"
+    warn 'Estimated retransmissions/segments are not packet loss. Path congestion, CPU and peer capacity can produce the same symptoms as a policer'
+    shape_put_fq "$SHAPE_IFACE" || die 'Cannot remove shaping for baseline'
+    shape_sample baseline unshaped
+    base_g=$SHAPE_SAMPLE_GOODPUT; base_r=$SHAPE_SAMPLE_RATIO
+    if shape_clean_sample; then
+        printf 'status=low-retransmissions\nNo shaping recommendation; a low sample does not establish that no policer exists.\n' > "$SHAPE_LOG_DIR/result.txt"
+        log 'Baseline retransmissions are low; no scan or persistent shaping is needed from this evidence'
+        return 0
+    fi
+    sleep 2; shape_sample baseline-repeat unshaped
+    base2_g=$SHAPE_SAMPLE_GOODPUT; base2_r=$SHAPE_SAMPLE_RATIO
+    if shape_clean_sample || ! awk -v a="$base_g" -v b="$base2_g" -v n="$SWEEP_NOMINAL" 'BEGIN {d=a-b;if(d<0)d=-d; exit !(d<=a*.15 && a>=n*.6 && b>=n*.6)}'; then
+        log 'Baselines vary or are far below nominal; evidence is inconclusive, so no rate is recommended'
+        printf 'status=inconclusive-baseline\n' > "$SHAPE_LOG_DIR/result.txt"; return 0
+    fi
+    read -r lo hi step < <(awk -v a="$base_g" -v b="$base2_g" -v n="$SWEEP_NOMINAL" 'BEGIN {g=(a<b?a:b);lo=int(g*.95);if(lo<1)lo=1;hi=int(g*1.8);if(hi>n*1.25)hi=int(n*1.25);if(hi>10000)hi=10000;step=int((hi-lo+9)/10);if(step<1)step=1;print lo,hi,step}')
+    ((hi > lo)) || { log 'No usable scan interval'; return 0; }
+    log "Scanning upward from received goodput: $lo..$hi Mbit/s, step $step, threshold 0.1% estimated retrans/segments"
+    rate=$lo
+    for ((i=0; i<11 && rate<=hi; i++)); do
+        if shape_sweep_rate "$rate" coarse; then clean=$rate
+        else bad=$rate; break; fi
+        ((rate < hi)) || break
+        rate=$((rate + step)); ((rate <= hi)) || rate=$hi
+    done
+    if ((clean == 0 || bad == 0)); then
+        log 'No repeatable clean/high-retransmission boundary was bracketed; no recommendation'
+        printf 'status=no-bracket\n' > "$SHAPE_LOG_DIR/result.txt"; return 0
+    fi
+    for ((i=0; i<4 && bad-clean>1; i++)); do
+        midpoint=$(((clean+bad)/2))
+        if shape_sweep_rate "$midpoint" fine; then clean=$midpoint; else bad=$midpoint; fi
+    done
+    candidate=$((clean * 97 / 100)); ((candidate >= 1)) || candidate=1
+    shape_put_rate "$SHAPE_IFACE" "$candidate" || die 'Cannot install validation rate'
+    shape_verify_rate "$SHAPE_IFACE" "$candidate" || die 'Cannot verify validation rate'
+    sleep 2; shape_sample validate-1 "$candidate"
+    final1_g=$SHAPE_SAMPLE_GOODPUT; final1_r=$SHAPE_SAMPLE_RATIO
+    shape_put_fq "$SHAPE_IFACE" || die 'Cannot restore unshaped validation control'
+    sleep 2; shape_sample baseline-final unshaped
+    compare_g=$SHAPE_SAMPLE_GOODPUT; compare_r=$SHAPE_SAMPLE_RATIO
+    shape_put_rate "$SHAPE_IFACE" "$candidate" || die 'Cannot install second validation rate'
+    shape_verify_rate "$SHAPE_IFACE" "$candidate" || die 'Cannot verify second validation rate'
+    sleep 2; shape_sample validate-2 "$candidate"
+    final2_g=$SHAPE_SAMPLE_GOODPUT; final2_r=$SHAPE_SAMPLE_RATIO
+    if awk -v b="$base_g" -v b2="$base2_g" -v b3="$compare_g" -v r="$base_r" -v r2="$base2_r" -v r3="$compare_r" -v g1="$final1_g" -v g2="$final2_g" -v t1="$final1_r" -v t2="$final2_r" '
+        BEGIN {max=b;if(b2>max)max=b2;if(b3>max)max=b3;min=b;if(b2<min)min=b2;if(b3<min)min=b3;low=r;if(r2<low)low=r2;if(r3<low)low=r3;
+        exit !(max<=min*1.15 && low>.1 && g1>=max*.98 && g2>=max*.98 && t1<=.1 && t2<=.1 && t1<=low*.2 && t2<=low*.2)}'; then
+        printf 'status=validated-suggestion\nrate_mbps=%s\nNo permanent shaping was applied.\n' "$candidate" > "$SHAPE_LOG_DIR/result.txt"
+        log "Both validation runs retained >=98% of the best baseline goodput and cut estimated retransmissions by >=80%. Suggested cap: $candidate Mbit/s"
+        printf 'To apply explicitly: sudo bash vps-tune.sh shape --rate-mbps %s\n' "$candidate"
+    else
+        printf 'status=inconclusive-validation\nNo permanent shaping was applied.\n' > "$SHAPE_LOG_DIR/result.txt"
+        log 'Repeated validation did not preserve throughput and reduce retransmissions consistently; no recommendation'
+    fi
+}
+
+shape_rollback() (
+    local SHAPE_IFACE='' SHAPE_BEFORE_RATE='' SHAPE_BEFORE_SIGNATURE='' SHAPE_RESTORE=0
+    local SHAPE_PERSIST_BACKUP='' SHAPE_WAS_ENABLED=0
+    trap - ERR EXIT
+    trap 'shape_transaction_finish "$?"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    trap 'exit 129' HUP
+    shape_read_active || die 'Invalid shaping state prevents safe rollback'
+    [[ -n $SHAPE_ACTIVE_IFACE ]] || return 0
+    shape_owned_files_guard
+    ((DRY == 0)) || { log "Would remove owned shaping and restore its fq queue on $SHAPE_ACTIVE_IFACE"; return 0; }
+    shape_require_owned "$SHAPE_ACTIVE_IFACE"
+    SHAPE_IFACE=$SHAPE_ACTIVE_IFACE; SHAPE_BEFORE_RATE=$SHAPE_ACTIVE_RATE
+    SHAPE_BEFORE_SIGNATURE=$(shape_signature "$SHAPE_IFACE")
+    [[ $SHAPE_BEFORE_SIGNATURE != 'qdisc fq '* ]] || SHAPE_BEFORE_RATE=''
+    shape_backup_persistence
+    SHAPE_RESTORE=1
+    shape_put_fq "$SHAPE_ACTIVE_IFACE" || die 'Cannot remove owned shaping'
+    [[ $(shape_signature "$SHAPE_ACTIVE_IFACE") == "$(cat "$STATE/shaping/fq.$SHAPE_ACTIVE_IFACE")" ]] || die 'fq restore did not match the saved parameters'
+    systemctl disable --now vps-tune-shape.service
+    rm -f -- "$STATE/shaping/active" "$STATE/shaping/active.signature"
+    SHAPE_RESTORE=0
+)
+
+run_shape_action() (
+    # A subshell confines all temporary experiment traps and state.
+    local required iface ipline address
+    local SHAPE_IFACE='' SHAPE_BEFORE_RATE='' SHAPE_BEFORE_SIGNATURE='' SHAPE_RESTORE=0
+    local SHAPE_PERSIST_BACKUP='' SHAPE_WAS_ENABLED=0 SHAPE_SAMPLE_COUNT=0 SHAPE_LOG_DIR='' SWEEP_ADDRESS='' SHAPE_IPERF_PID=''
+    local SHAPE_ACTIVE_IFACE='' SHAPE_ACTIVE_RATE='' SHAPE_SAMPLE_GOODPUT='' SHAPE_SAMPLE_RATIO=''
+    local -a interfaces=()
+    trap - ERR EXIT
+    trap 'shape_transaction_finish "$?"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    trap 'exit 129' HUP
+    ((TEST == 0)) || die 'Shaping experiments are disabled in containers'
+    for required in ip tc awk sed; do command -v "$required" >/dev/null || die "Missing $required; install prerequisites first"; done
+    shape_read_active || die 'Invalid active shaping state'
+    if [[ -n $SHAPE_ACTIVE_IFACE ]]; then SHAPE_IFACE=$SHAPE_ACTIVE_IFACE
+    else
+        mapfile -t interfaces < <({ ip -o -4 route show default; ip -o -6 route show default; } | awk '{for(i=1;i<NF;i++)if($i=="dev")print $(i+1)}' | sort -u)
+        ((${#interfaces[@]} == 1)) || die 'shape/sweep require exactly one default-route interface'
+        SHAPE_IFACE=${interfaces[0]}
+    fi
+    [[ $SHAPE_IFACE =~ ^[a-zA-Z0-9_.:-]{1,15}$ && $SHAPE_IFACE != . && $SHAPE_IFACE != .. ]] || die 'Invalid interface name'
+    if [[ $ACTION == shape && $SHAPE_OFF == 1 && -z $SHAPE_ACTIVE_IFACE ]]; then log 'No owned shaping is active'; return 0; fi
+    shape_require_owned "$SHAPE_IFACE"
+    if [[ $ACTION == sweep ]]; then
+        log "Traffic budget: at most 28 samples, each 8 measured + 2 warmup seconds, timeout 22 seconds; nominal $SWEEP_NOMINAL Mbit/s"
+        log "Nominal-rate planning estimate (28 tests): $(awk -v n="$SWEEP_NOMINAL" 'BEGIN{printf "%.2f",n*28*10/8000}') GB sent; unshaped tests can exceed nominal, so this is NOT a hard byte cap"
+        ((SWEEP_NOMINAL <= 2500)) || warn 'Above 2500 Mbit/s: high traffic and HTB CPU cost can invalidate the experiment'
+    fi
+    if ((DRY)); then log "DRY RUN: would run $ACTION on $SHAPE_IFACE; no iperf3, configuration, queue or service changes"; return 0; fi
+    KERNEL=skip; preflight
+    exec 9>/run/lock/vps-tune.lock
+    flock -n 9 || die 'Another vps-tune is running'
+    shape_require_owned "$SHAPE_IFACE"
+    shape_owned_files_guard
+    init_state
+    SHAPE_BEFORE_SIGNATURE=$(shape_signature "$SHAPE_IFACE")
+    SHAPE_BEFORE_RATE=$SHAPE_ACTIVE_RATE
+    [[ $SHAPE_BEFORE_SIGNATURE != 'qdisc fq '* ]] || SHAPE_BEFORE_RATE=''
+    if [[ $ACTION == sweep ]]; then
+        for required in iperf3 jq timeout getent; do command -v "$required" >/dev/null || die "sweep requires preinstalled $required; no packages are installed automatically"; done
+        # Resolve only the explicitly supplied peer; never select public peers.
+        address=$(getent ahosts "$SWEEP_PEER" | awk 'NR==1 {print $1}') || die 'Cannot resolve the supplied peer'
+        [[ -n $address ]] || die 'Cannot resolve the supplied peer'
+        ipline=$(ip route get "$address") || die 'Cannot route to supplied peer'
+        iface=$(awk '{for(i=1;i<NF;i++)if($i=="dev"){print $(i+1);exit}}' <<< "$ipline")
+        [[ $iface == "$SHAPE_IFACE" ]] || die 'Peer route differs from the managed interface; no traffic sent'
+        SWEEP_ADDRESS=$address
+        SHAPE_RESTORE=1
+        shape_run_sweep
+        return 0
+    fi
+    shape_backup_persistence
+    SHAPE_RESTORE=1
+    if ((SHAPE_OFF)); then
+        shape_put_fq "$SHAPE_IFACE" || die 'Cannot remove shaping'
+        [[ $(shape_signature "$SHAPE_IFACE") == "$(cat "$STATE/shaping/fq.$SHAPE_IFACE")" ]] || die 'Restored fq differs from its original parameters'
+        systemctl disable --now vps-tune-shape.service
+        rm -f -- "$STATE/shaping/active" "$STATE/shaping/active.signature"
+        SHAPE_RESTORE=0
+        log "Removed shaping on $SHAPE_IFACE; its previous owned fq queue is restored"
+        return 0
+    fi
+    shape_put_rate "$SHAPE_IFACE" "$SHAPE_RATE" || die 'Cannot apply HTB/fq'
+    shape_verify_rate "$SHAPE_IFACE" "$SHAPE_RATE" || die 'HTB rate verification failed'
+    shape_write_service
+    printf '%s %s\n' "$SHAPE_IFACE" "$SHAPE_RATE" > "$STATE/shaping/active"
+    shape_signature "$SHAPE_IFACE" > "$STATE/shaping/active.signature"
+    systemctl daemon-reload
+    systemctl enable vps-tune-shape.service
+    systemctl is-enabled --quiet vps-tune-shape.service || die 'Shaping service could not be enabled'
+    SHAPE_RESTORE=0
+    log "Applied aggregate HTB ${SHAPE_RATE} Mbit/s + fq to $SHAPE_IFACE; boot service enabled"
+)
+
+# END OPTIONAL SHAPING
 
 main() {
     if (($# == 0)); then
@@ -1528,13 +2193,20 @@ main() {
     fi
     parse_args "$@"
     check_os
-    if [[ $ACTION != queue ]]; then QDISC=$(configured_qdisc); fi
+    if ((QDISC_EXPLICIT == 0)); then QDISC=$(configured_qdisc); fi
+    if [[ $ACTION == apply && -f $STATE/shaping/active && $QDISC != fq ]]; then
+        die 'Active shaping needs the fq default; run shape --off before changing the base qdisc'
+    fi
     if [[ $ACTION == check ]]; then
         # A pending verification (2) is a normal check result, not an ERR trap.
         if check_status; then exit 0; else exit "$?"; fi
     fi
     ((EUID == 0)) || die 'Run as root'
     if [[ $ACTION == menu ]]; then interactive_menu; return; fi
+    if [[ $ACTION == shape || $ACTION == sweep ]]; then
+        run_shape_action
+        return
+    fi
     if [[ $ACTION == queue ]]; then
         if ((DRY == 0)); then
             preflight
