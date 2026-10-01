@@ -65,6 +65,14 @@ TUNE_LOCK_HELD=0
 SCAN_TOOLS_ROOT=
 PERSIST_SCAN_TOOLS=0
 TOOLS_STAGING=
+TCPFIT_MIGRATE=0
+TCPFIT_UNIT=/etc/systemd/system/tcpfit-qdisc.service
+TCPFIT_HELPER=/usr/local/sbin/tcpfit-qdisc.sh
+TCPFIT_MIGRATION_NEEDED=0
+TCPFIT_MIGRATION_IFACE=
+TCPFIT_MIGRATION_RATE=
+TCPFIT_CANDIDATE=
+TCPFIT_LOCK_HELD=0
 
 ui_text() {
     local tone=$1 value=$2 code=
@@ -167,6 +175,8 @@ Usage: bash vps-tune.sh                    # Chinese interactive menu
                           Missing tools use an isolated Debian runtime;
                           no global package installation for scanning.
   --apply-suggested-shape With --smart-sweep: apply only a validated suggestion.
+  --migrate-tcpfit        With --smart-sweep: back up and take over a supported
+                          tcpfit shaper, retaining its rate before scanning.
   shape --rate-mbps NUMBER Apply an aggregate egress cap with HTB + fq.
   shape --off             Remove owned shaping; keep base tuning and fq.
   sweep --peer HOST --nominal-mbps NUMBER --accept-traffic
@@ -218,6 +228,7 @@ parse_args() {
             --smart-bandwidth) SMART=1; shift ;;
             --smart-sweep) SMART_SWEEP=1; shift ;;
             --apply-suggested-shape) APPLY_SUGGESTED_SHAPE=1; shift ;;
+            --migrate-tcpfit) TCPFIT_MIGRATE=1; shift ;;
             --auto-rtt) RTT_AUTO=1; shift ;;
             --speedtest) SPEEDTEST=1; shift ;;
             --accept-speedtest-terms) ACCEPT_SPEEDTEST=1; shift ;;
@@ -1346,6 +1357,7 @@ check_status() {
 rollback() {
     [[ -s $STATE/manifest ]] || die 'No tracked configuration to restore'
     local path key value archived failed=0
+    tcpfit_rollback_preflight
     while IFS= read -r path; do
         if [[ -f $STATE/expected-absent$path && ( -e $path || -L $path ) ]]; then
             die "Rollback would delete a later file: $path. Back it up/reconcile first"
@@ -1355,6 +1367,10 @@ rollback() {
         fi
     done < "$STATE/manifest"
     ((DRY == 0)) || { log 'Would restore the following paths:'; cat "$STATE/manifest"; return 0; }
+    [[ ! -e $STATE/tcpfit-migration ]] || tcpfit_lock
+    if [[ $(tcpfit_migration_state) == pending ]]; then
+        tcpfit_migration_abort || die '未完成的 tcpfit 迁移恢复失败，备份已保留。'
+    fi
     if ((TEST == 0)); then shape_rollback; fi
     while IFS= read -r path; do
         if [[ -f $STATE/original$path ]]; then cp -a -- "$STATE/original$path" "$path"; else rm -f -- "$path"; fi
@@ -1383,6 +1399,7 @@ rollback() {
     if ((failed)); then
         die 'Persistent files restored, but live rollback is incomplete; backup retained for retry'
     fi
+    tcpfit_migration_rollback
     archived="${STATE}.rolled-back.$(date +%Y%m%d%H%M%S).$$"
     mv -- "$STATE" "$archived"
     log "Configuration restored; audit backup: $archived"
@@ -1665,6 +1682,12 @@ menu_smart() {
         fi
     fi
     if ((scan)); then
+        if [[ -f $TCPFIT_UNIT || -f $TCPFIT_HELPER ]]; then
+            printf '检测到 tcpfit 整形文件；接管会备份旧配置、停用旧服务，并先保留原限速。\n'
+            menu_read '是否迁移已验证的 tcpfit 整形后继续扫描 [y/N]：' n || return 0
+            if [[ $REPLY != y && $REPLY != Y ]]; then printf '未接管已有整形，返回菜单。\n'; return 0; fi
+            MENU_ARGS+=(--migrate-tcpfit)
+        fi
         MENU_ARGS+=(--smart-sweep --peer "$peer")
         ((DRY)) || MENU_ARGS+=(--accept-traffic)
         ((automatic == 0)) || MENU_ARGS+=(--apply-suggested-shape)
@@ -2142,7 +2165,8 @@ prepare_scan_tools() {
             ip|tc) package=iproute2; PERSIST_SCAN_TOOLS=1 ;;
             sysctl) package=procps; PERSIST_SCAN_TOOLS=1 ;;
             modprobe|modinfo) package=kmod; PERSIST_SCAN_TOOLS=1 ;;
-            iperf3|jq) package=$tool ;;
+            iperf3) package=iperf3 ;;
+            jq) package=jq; if ((TCPFIT_MIGRATE)); then PERSIST_SCAN_TOOLS=1; fi ;;
             timeout) package=coreutils ;;
             getent) package=libc-bin ;;
         esac
@@ -2208,6 +2232,482 @@ persist_scan_tools() {
     log "开机所需工具保存在 $STATE/tools；未修改系统软件包数据库。"
 }
 
+# BEGIN TCPFIT QUEUE SNAPSHOTS
+# Strict tcpfit queue snapshots. Callers own service/lock/filter checks and must
+# authenticate the backup fingerprint before restoring it. No saved file is
+# sourced or evaluated. DEST must be a private directory with unused filenames.
+tcpfit_queue_error() { printf 'tcpfit queue: %s\n' "$*" >&2; return 1; }
+
+# iproute2 6.1 (Debian 12) ignores -j for class show. Accept its one supported
+# detailed line verbatim in structure; any extra class, token or option fails.
+tcpfit_queue_class_json() {
+    local raw=$1
+    if jq -e 'type=="array"' <<< "$raw" >/dev/null 2>&1; then
+        printf '%s\n' "$raw"
+        return 0
+    fi
+    jq -e -n --arg text "$raw" '
+        def integer_value:
+            . as $n | (($n+0.5)|floor) as $rounded |
+            if (($n-$rounded)|fabs)<0.00001 then $rounded else error("inexact tc numeric output") end;
+        def bytes($text):
+            ($text|capture("^(?<n>[0-9]+(?:\\.[0-9]+)?)(?<u>[KMG]?b)$")) as $v |
+            (($v.n|tonumber)*({b:1,Kb:1024,Mb:1048576,Gb:1073741824}[$v.u])) | integer_value;
+        def rate($text):
+            ($text|capture("^(?<n>[0-9]+(?:\\.[0-9]+)?)(?<u>[KMG]?bit)$")) as $v |
+            (($v.n|tonumber)*({bit:1,Kbit:1000,Mbit:1000000,Gbit:1000000000}[$v.u])/8) | integer_value;
+        "^\\s*class htb 1:10 root leaf 10: prio (?<prio>[0-9]+) quantum (?<quantum>[0-9]+) rate (?<rate>[0-9]+(?:\\.[0-9]+)?[KMG]?bit) ceil (?<ceil>[0-9]+(?:\\.[0-9]+)?[KMG]?bit) linklayer ethernet burst (?<burst>[0-9]+(?:\\.[0-9]+)?[KMG]?b)/(?<burst_cell>[0-9]+) mpu (?<mpu_rate>[0-9]+(?:\\.[0-9]+)?[KMG]?b) cburst (?<cburst>[0-9]+(?:\\.[0-9]+)?[KMG]?b)/(?<cburst_cell>[0-9]+) mpu (?<mpu_ceil>[0-9]+(?:\\.[0-9]+)?[KMG]?b) level (?<level>[0-9]+)\\s*$" as $pattern |
+        if ($text|test($pattern)) then ($text|capture($pattern)) else error("unsupported detailed tc class text") end |
+        [{class:"htb",handle:"1:10",root:true,leaf:"0x10",linklayer:"ethernet",
+          prio:(.prio|tonumber),quantum:(.quantum|tonumber),rate:rate(.rate),ceil:rate(.ceil),
+          burst:bytes(.burst),burst_cell:(.burst_cell|tonumber),mpu_rate:bytes(.mpu_rate),
+          cburst:bytes(.cburst),cburst_cell:(.cburst_cell|tonumber),mpu_ceil:bytes(.mpu_ceil),level:(.level|tonumber)}]'
+}
+
+tcpfit_queue_signature_json() {
+    jq -S -n --argjson q "$1" --argjson c "$2" '
+        {qdisc: ($q | map(del(.refcnt, .options.direct_packets_stat)) | sort_by(.handle)),
+         class: ($c | sort_by(.handle))}'
+}
+
+tcpfit_queue_signature() {
+    local iface=$1 qdisc classes
+    qdisc=$(tc -j -d qdisc show dev "$iface") || return 1
+    classes=$(tc -j -d class show dev "$iface") || return 1
+    classes=$(tcpfit_queue_class_json "$classes") || return 1
+    tcpfit_queue_signature_json "$qdisc" "$classes"
+}
+
+# Parse captured JSON independently of tc, also usable with kernel-version
+# fixtures. Numeric tc JSON rates are bytes/sec; ordinary delays are us, but
+# timer_slack is ns. FQ quantum and HTB quantum take unsuffixed integers.
+tcpfit_queue_parse() {
+    local iface=$1 destination=$2 kind manifest
+    [[ $iface =~ ^[a-zA-Z0-9_.:-]{1,15}$ && $iface != . && $iface != .. ]] || return 1
+    manifest=$(jq -e -n --arg iface "$iface" \
+        --slurpfile q "$destination/qdisc.json" --slurpfile c "$destination/class.json" '
+        def uint($max): type == "number" and . >= 0 and . <= $max and floor == .;
+        def pos($max): uint($max) and . > 0;
+        def keys_only($allowed): type == "object" and ((keys - $allowed) | length == 0);
+        def power2: . as $n | [range(0;32) | pow(2;.)] | index($n) != null;
+        def require($condition; $message): if $condition then . else error($message) end;
+        require(($q|length)==1 and ($c|length)==1; "JSON must contain one document") |
+        $q[0] as $queues | $c[0] as $classes |
+        require(($queues|type)=="array" and ($queues|length)==2 and
+                ($classes|type)=="array" and ($classes|length)==1; "unexpected queue/class count") |
+        ($queues | map(select(.kind=="htb" and .handle=="1:"))) as $roots |
+        ($queues | map(select(.kind=="fq" and .handle=="10:"))) as $leaves |
+        require(($roots|length)==1 and ($leaves|length)==1; "expected tcpfit handles 1:/10:") |
+        $roots[0] as $root | $leaves[0] as $leaf | $classes[0] as $class |
+        require(($root|keys_only(["kind","handle","root","refcnt","options"])) and
+                $root.root==true and (($root.refcnt // 0)|uint(4294967295)); "unexpected HTB root metadata") |
+        require(($leaf|keys_only(["kind","handle","parent","refcnt","options"])) and
+                $leaf.parent=="1:10" and (($leaf.refcnt // 0)|uint(4294967295)); "unexpected FQ leaf metadata") |
+        $root.options as $r |
+        require(($r|keys_only(["r2q","default","direct_packets_stat","ver","direct_qlen"])) and
+                $r.r2q==10 and ($r.default=="0x10" or $r.default==16) and
+                ($r.direct_qlen|uint(4294967295)) and
+                ($r.direct_packets_stat|uint(4294967295)) and
+                ($r.ver|type)=="string" and ($r.ver|test("^3\\.[0-9]+$")); "unsupported HTB root options") |
+        require(($class|keys_only(["class","handle","root","leaf","prio","quantum","rate","ceil","linklayer","burst","burst_cell","mpu_rate","cburst","cburst_cell","mpu_ceil","level"])) and
+                $class.class=="htb" and $class.handle=="1:10" and $class.root==true and
+                ($class.leaf=="0x10" or $class.leaf=="10:" or $class.leaf==16) and
+                $class.prio==0 and $class.quantum==1514 and $class.linklayer=="ethernet" and
+                $class.mpu_rate==0 and $class.mpu_ceil==0 and $class.level==0 and
+                ($class.rate|pos(12500000000)) and $class.ceil==$class.rate and
+                (($class.rate/125000)|pos(100000)); "unsupported tcpfit HTB class") |
+        ($class.rate/125000) as $rate |
+        ([($rate*500),32768]|max) as $burst |
+        require(($class.burst|uint(50000000)) and ($class.cburst|uint(50000000)) and
+                (($class.burst-$burst)|fabs)<=1 and (($class.cburst-$burst)|fabs)<=1 and
+                ($class.burst_cell|pos(2147483648)) and ($class.burst_cell|power2) and
+                ($class.cburst_cell|pos(2147483648)) and ($class.cburst_cell|power2);
+                "unsupported tcpfit burst/cell parameters") |
+        $leaf.options as $raw |
+        require(($raw|keys_only(["limit","flow_limit","buckets","orphan_mask","quantum","initial_quantum","maxrate","low_rate_threshold","defrate","refill_delay","timer_slack","horizon","horizon_drop","horizon_cap","pacing","ce_threshold","bands","priomap","priomap ","weights","weights ","offload_horizon"]));
+                "unknown FQ option prevents exact restoration") |
+        require((($raw|has("priomap")) and ($raw|has("priomap "))|not) and
+                ((($raw|has("weights")) and ($raw|has("weights ")))|not);
+                "duplicate FQ array aliases") |
+        ($raw | if has("priomap ") then .priomap = .["priomap "] | del(.["priomap "]) else . end |
+                if has("weights ") then .weights = .["weights "] | del(.["weights "]) else . end) as $f |
+        require($f.limit==40960 and $f.flow_limit==8192 and $f.maxrate==$class.rate and
+                ($f.maxrate|pos(4294967294)) and
+                ($f.buckets|pos(2147483648)) and ($f.buckets|power2) and
+                ($f.orphan_mask|uint(4294967295)) and ($f.quantum|pos(4294967295)) and
+                ($f.initial_quantum|pos(4294967295)) and ($f.refill_delay|uint(4294967295)) and
+                ($f.timer_slack|uint(4294967295)) and ($f.horizon|uint(4294967295)); "unsupported FQ values") |
+        require(([$f | to_entries[] | select(.key=="low_rate_threshold" or .key=="defrate" or .key=="ce_threshold" or .key=="offload_horizon") | .value | uint(4294967295)] | all);
+                "invalid FQ optional numeric value") |
+        require((($f|has("horizon_drop")) != ($f|has("horizon_cap"))) and
+                (if ($f|has("horizon_drop")) then $f.horizon_drop==null else $f.horizon_cap==null end) and
+                (if ($f|has("pacing")) then ($f.pacing|type)=="boolean" else true end);
+                "invalid FQ mode flags") |
+        require((if ($f|has("bands")) or ($f|has("priomap")) then
+                    $f.bands==3 and ($f.priomap|type)=="array" and ($f.priomap|length)==16 and ($f.priomap|all(.[];uint(2)))
+                 else true end) and
+                (if ($f|has("weights")) then ($f.weights|type)=="array" and ($f.weights|length)==3 and ($f.weights|all(.[];pos(2147483647))) else true end);
+                "invalid FQ bands, priomap or weights") |
+        {rate: $rate,
+         root: ["qdisc","replace","dev",$iface,"root","handle","1:","htb","default","10","r2q","10","direct_qlen",($r.direct_qlen|tostring)],
+         class: ["class","replace","dev",$iface,"parent","1:","classid","1:10","htb",
+                 "rate",(($class.rate*8|tostring)+"bit"),"ceil",(($class.ceil*8|tostring)+"bit"),
+                 "burst",(($burst|tostring)+"b/"+($class.burst_cell|tostring)),
+                 "cburst",(($burst|tostring)+"b/"+($class.cburst_cell|tostring)),
+                 "quantum","1514","prio","0","mpu","0","linklayer","ethernet"],
+         fq: (["qdisc","replace","dev",$iface,"parent","1:10","handle","10:","fq"] +
+              (["limit","flow_limit","buckets","orphan_mask","quantum","initial_quantum"] |
+                  map(. as $key | [$key,($f[$key]|tostring)]) | add) +
+              ["maxrate",(($f.maxrate*8|tostring)+"bit"),
+               "low_rate_threshold",((($f.low_rate_threshold // 0)*8|tostring)+"bit"),
+               "defrate",((($f.defrate // 0)*8|tostring)+"bit"),
+               "refill_delay",(($f.refill_delay|tostring)+"us"),
+               "timer_slack",(($f.timer_slack|tostring)+"ns"),
+               "horizon",(($f.horizon|tostring)+"us"),
+               (if ($f|has("horizon_drop")) then "horizon_drop" else "horizon_cap" end),
+               (if $f.pacing==false then "nopacing" else "pacing" end)] +
+              (if ($f|has("ce_threshold")) then ["ce_threshold",(($f.ce_threshold|tostring)+"us")] else [] end) +
+              (if ($f|has("bands")) then ["bands","3","priomap"]+($f.priomap|map(tostring)) else [] end) +
+              (if ($f|has("weights")) then ["weights"]+($f.weights|map(tostring)) else [] end) +
+              (if ($f|has("offload_horizon")) then ["offload_horizon",(($f.offload_horizon|tostring)+"us")] else [] end))}
+        ') || { tcpfit_queue_error 'unsupported/ambiguous tcpfit queue; left untouched'; return 1; }
+    for kind in root class fq; do
+        jq -j --arg kind "$kind" '.[$kind][] | ., "\u0000"' <<< "$manifest" > "$destination/$kind.args" || return 1
+    done
+    TCPFIT_MIGRATION_RATE=$(jq -r '.rate' <<< "$manifest") || return 1
+    tcpfit_queue_signature_json "$(cat "$destination/qdisc.json")" "$(cat "$destination/class.json")" > "$destination/signature" || return 1
+}
+
+tcpfit_queue_capture() {
+    local iface=$1 destination=$2 file classes
+    TCPFIT_MIGRATION_RATE=
+    [[ ! -L $destination ]] || return 1
+    mkdir -p -- "$destination" || return 1
+    chmod 700 -- "$destination" || return 1
+    for file in qdisc.json class.json signature root.args class.args fq.args; do
+        [[ ! -e $destination/$file && ! -L $destination/$file ]] || {
+            tcpfit_queue_error "snapshot path already exists: $destination/$file"; return 1;
+        }
+    done
+    tc -j -d qdisc show dev "$iface" > "$destination/qdisc.json" || return 1
+    classes=$(tc -j -d class show dev "$iface") || return 1
+    tcpfit_queue_class_json "$classes" > "$destination/class.json" || return 1
+    tcpfit_queue_parse "$iface" "$destination"
+}
+
+tcpfit_queue_restore() {
+    local iface=$1 destination=$2 kind actual
+    local -a argv=()
+    [[ $iface =~ ^[a-zA-Z0-9_.:-]{1,15}$ && $iface != . && $iface != .. ]] || return 1
+    # Authentication of these generated, NUL-delimited files is the callers
+    # responsibility. Still bind their interface and top-level operation here.
+    for kind in root class fq; do
+        [[ -f $destination/$kind.args && ! -L $destination/$kind.args ]] || return 1
+        mapfile -d '' -t argv < "$destination/$kind.args" || return 1
+        ((${#argv[@]} >= 9)) || return 1
+        [[ ${argv[1]} == replace && ${argv[2]} == dev && ${argv[3]} == "$iface" ]] || return 1
+        if [[ $kind == class ]]; then [[ ${argv[0]} == class ]] || return 1
+        else [[ ${argv[0]} == qdisc ]] || return 1; fi
+    done
+    # Replacing a same-handle qdisc may retain options/classes not passed on the
+    # command line. First create a fresh, different root, then rebuild tcpfit.
+    tc qdisc replace dev "$iface" root handle 7a01: fq || return 1
+    for kind in root class fq; do
+        mapfile -d '' -t argv < "$destination/$kind.args" || return 1
+        tc "${argv[@]}" || return 1
+    done
+    actual=$(tcpfit_queue_signature "$iface") || return 1
+    [[ $actual == "$(cat "$destination/signature")" ]] || {
+        tcpfit_queue_error 'restored queue differs from captured detailed signature'; return 1;
+    }
+}
+# END TCPFIT QUEUE SNAPSHOTS
+
+# BEGIN TCPFIT TEMPLATES
+# Recognize supported tcpfit persistence files as data. Never source or execute
+# a candidate file. Unknown shell/unit syntax is deliberately rejected.
+tcpfit_helper_matches() {
+    local file=${1:-} rate=${2:-} iface=${3:-} first actual expected
+    [[ -f $file && -r $file && ! -L $file ]] || return 1
+    [[ $rate =~ ^[1-9][0-9]{0,5}$ ]] && ((rate <= 100000)) || return 1
+    [[ $iface =~ ^[a-zA-Z0-9_.:-]{1,15}$ && $iface != . && $iface != .. ]] || return 1
+    # The interpreter is executable metadata, not an ignorable comment. A
+    # leading blank line, CRLF, altered interpreter or shebang options fail.
+    IFS= read -r first < "$file" || return 1
+    [[ $first == '#!/bin/bash' ]] || return 1
+    actual=$(LC_ALL=C awk '
+        index($0, "\0") { exit 1 }
+        { sub(/[ \t]+$/, "") }
+        /^[ \t]*$/ { next }
+        /^[ \t]*#/ && !/^#!/ { next }
+        { print }
+    ' "$file") || return 1
+    # Verified against write_qdisc() in the referenced tcpfit.sh. Keep command
+    # spacing, quoting, inline comments and line boundaries exact. Only the
+    # allowlisted rate and interface are interpolated into this known template.
+    expected=$(cat <<EOF
+#!/bin/bash
+IF=\${TCPFIT_IF:-}
+[ -n "\$IF" ] || IF=\$(ip -o -4 route show default 2>/dev/null | head -1 |
+      awk '{for(i=1;i<NF;i++) if(\$i=="dev"){print \$(i+1); exit}}')
+[ -n "\$IF" ] || IF=${iface}
+RATE=\${1:-${rate}}
+BURST=\$(awk -v r="\$RATE" 'BEGIN{v=r*500; if(v<32768)v=32768; printf "%d",v}')
+if ! tc qdisc del dev \$IF root 2>/dev/null; then
+  case "\$(tc qdisc show dev \$IF 2>/dev/null | head -1)" in
+    *" mq "*) tc qdisc replace dev \$IF root handle 1: mq 2>/dev/null &&
+              tc qdisc del dev \$IF root 2>/dev/null ;;
+  esac
+fi
+tc qdisc replace dev \$IF root handle 1: htb default 10 || exit 1
+tc class replace dev \$IF parent 1: classid 1:10 htb rate \${RATE}mbit ceil \${RATE}mbit burst \${BURST} cburst \${BURST} quantum 1514 || exit 1
+tc qdisc replace dev \$IF parent 1:10 handle 10: fq limit 40960 flow_limit 8192 maxrate \${RATE}mbit || exit 1
+EOF
+    ) || return 1
+    [[ $actual == "$expected" ]]
+}
+
+tcpfit_unit_matches() {
+    local file=${1:-} rate=${2:-} actual expected
+    [[ -f $file && -r $file && ! -L $file ]] || return 1
+    [[ $rate =~ ^[1-9][0-9]{0,5}$ ]] && ((rate <= 100000)) || return 1
+    actual=$(LC_ALL=C awk '
+        index($0, "\0") { exit 1 }
+        { sub(/[ \t]+$/, "") }
+        /^[ \t]*$/ { next }
+        /^[ \t]*[#;]/ { next }
+        { print }
+    ' "$file") || return 1
+    expected=$(cat <<EOF
+[Unit]
+Description=tcpfit egress shaper
+After=network-online.target
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/tcpfit-qdisc.sh ${rate}
+[Install]
+WantedBy=multi-user.target
+EOF
+    ) || return 1
+    [[ $actual == "$expected" ]]
+}
+# END TCPFIT TEMPLATES
+
+tcpfit_lock() {
+    ((TCPFIT_LOCK_HELD == 0)) || return 0
+    exec 8>/var/lock/tcpfit.lock
+    flock -n 8 || die 'tcpfit 正在运行；请结束该操作后重试迁移。'
+    TCPFIT_LOCK_HELD=1
+}
+
+tcpfit_service_value() { systemctl show -p "$1" --value tcpfit-qdisc.service; }
+
+tcpfit_migration_preflight() {
+    local iface=$1 file mode filters parent enabled active
+    [[ ! -e $STATE/tcpfit-migration ]] || die '已有 tcpfit 迁移记录；请先检查状态或 rollback，不重复覆盖备份。'
+    tcpfit_lock
+    for file in "$TCPFIT_UNIT" "$TCPFIT_HELPER"; do
+        [[ -f $file && ! -L $file ]] || die "tcpfit 文件缺失或为软链接：$file"
+        [[ $(stat -c %u "$file") == "$EUID" ]] || die "tcpfit 文件所有者异常：$file"
+        mode=$(stat -c %a "$file")
+        (( (8#$mode & 022) == 0 )) || die "tcpfit 文件可被其他用户修改：$file"
+    done
+    [[ $(tcpfit_service_value FragmentPath) == "$TCPFIT_UNIT" ]] || die 'tcpfit 服务来源不是预期的本地单元文件。'
+    [[ -z $(tcpfit_service_value DropInPaths) ]] || die 'tcpfit 服务有自定义 drop-in，不能自动迁移。'
+    [[ $(tcpfit_service_value NeedDaemonReload) == no ]] || die 'tcpfit 服务文件与已加载配置不一致；请先核对并 daemon-reload。'
+    enabled=$(tcpfit_service_value UnitFileState)
+    active=$(tcpfit_service_value ActiveState)
+    [[ $enabled == enabled || $enabled == disabled ]] || die 'tcpfit 服务启用状态不支持自动迁移。'
+    [[ $active == active || $active == inactive ]] || die 'tcpfit 服务当前未处于稳定状态。'
+    for parent in root 1: 1:10 10:; do
+        if [[ $parent == root ]]; then filters=$(tc filter show dev "$iface" root)
+        else filters=$(tc filter show dev "$iface" parent "$parent"); fi
+        [[ -z $filters ]] || die "tcpfit 队列 $parent 上存在过滤器，未修改规则。"
+    done
+    ensure_tmp
+    TCPFIT_CANDIDATE=$(mktemp -d "$TMP/tcpfit.XXXXXXXX")
+    tcpfit_queue_capture "$iface" "$TCPFIT_CANDIDATE"
+    tcpfit_unit_matches "$TCPFIT_UNIT" "$TCPFIT_MIGRATION_RATE" || die 'tcpfit 服务不是受支持的标准模板，未迁移。'
+    tcpfit_helper_matches "$TCPFIT_HELPER" "$TCPFIT_MIGRATION_RATE" "$iface" || die 'tcpfit 整形助手不是受支持的标准模板，未迁移。'
+    printf '%s\n' "$iface" > "$TCPFIT_CANDIDATE/iface"
+    printf '%s\n' "$TCPFIT_MIGRATION_RATE" > "$TCPFIT_CANDIDATE/rate"
+    printf '%s\n' "$enabled" > "$TCPFIT_CANDIDATE/enabled"
+    printf '%s\n' "$active" > "$TCPFIT_CANDIDATE/active"
+    cp -a -- "$TCPFIT_UNIT" "$TCPFIT_CANDIDATE/tcpfit.unit"
+    cp -a -- "$TCPFIT_HELPER" "$TCPFIT_CANDIDATE/tcpfit.helper"
+    TCPFIT_MIGRATION_IFACE=$iface
+    TCPFIT_MIGRATION_NEEDED=1
+    log "已验证 tcpfit：$iface，聚合限速 $TCPFIT_MIGRATION_RATE Mbit/s；迁移将保留该速率。"
+}
+
+tcpfit_backup_verify() {
+    local backup=$STATE/tcpfit-migration expected
+    [[ -d $backup/original && ! -L $backup && ! -L $backup/original && -f $backup/original.sha256 ]] || die 'tcpfit 迁移备份不完整。'
+    expected=$(cat "$backup/original.sha256")
+    [[ $expected =~ ^[a-f0-9]{64}$ && $(isolated_tools_fingerprint "$backup/original") == "$expected" ]] || die 'tcpfit 迁移备份已被修改，停止恢复。'
+}
+
+tcpfit_migration_state() {
+    [[ ! -f $STATE/tcpfit-migration/status ]] || cat "$STATE/tcpfit-migration/status"
+}
+
+tcpfit_set_migration_state() {
+    printf '%s\n' "$1" > "$STATE/tcpfit-migration/.status.new" || return 1
+    mv -f -- "$STATE/tcpfit-migration/.status.new" "$STATE/tcpfit-migration/status" || return 1
+}
+
+tcpfit_restore_original() {
+    local original=$STATE/tcpfit-migration/original iface enabled active file saved
+    local -a interfaces=()
+    tcpfit_backup_verify
+    tcpfit_lock
+    iface=$(cat "$original/iface"); enabled=$(cat "$original/enabled"); active=$(cat "$original/active")
+    mapfile -t interfaces < <({ ip -o -4 route show default; ip -o -6 route show default; } |
+        awk '{for(i=1;i<NF;i++) if($i=="dev") print $(i+1)}' | sort -u)
+    [[ ${#interfaces[@]} == 1 && ${interfaces[0]} == "$iface" ]] || { warn '默认网卡已变化，不能启动原 tcpfit 服务；备份保留。'; return 1; }
+    # A later tcpfit run must never be overwritten by rollback.
+    for file in "$TCPFIT_UNIT" "$TCPFIT_HELPER"; do
+        saved=tcpfit.helper; [[ $file != "$TCPFIT_UNIT" ]] || saved=tcpfit.unit
+        if [[ -e $file || -L $file ]]; then
+            if [[ ! -f $file || -L $file ]] || ! cmp -s "$file" "$original/$saved"; then
+                warn "tcpfit 原路径已有后续改动：$file"; return 1
+            fi
+        fi
+    done
+    [[ -z $(tcpfit_service_value DropInPaths) ]] || { warn 'tcpfit 新增了自定义服务配置，停止恢复。'; return 1; }
+    cp -a -- "$original/tcpfit.helper" "$TCPFIT_HELPER" || return 1
+    cp -a -- "$original/tcpfit.unit" "$TCPFIT_UNIT" || return 1
+    systemctl daemon-reload || return 1
+    if [[ $enabled == enabled ]]; then systemctl enable tcpfit-qdisc.service || return 1
+    else systemctl disable tcpfit-qdisc.service || return 1; fi
+    if [[ $active == active ]]; then
+        # Start only the exact supported helper verified above, on the same
+        # default interface. Replay all captured options after it has exited.
+        systemctl start tcpfit-qdisc.service || return 1
+    else
+        systemctl stop tcpfit-qdisc.service || return 1
+    fi
+    tcpfit_queue_restore "$iface" "$original" || return 1
+    [[ $(tcpfit_service_value UnitFileState) == "$enabled" && $(tcpfit_service_value ActiveState) == "$active" ]] || return 1
+}
+
+tcpfit_migration_abort() {
+    local original=$STATE/tcpfit-migration/original iface failed=0
+    local SHAPE_PERSIST_BACKUP SHAPE_WAS_ENABLED
+    tcpfit_backup_verify
+    iface=$(cat "$original/iface")
+    SHAPE_PERSIST_BACKUP=$original/vps-persistence
+    SHAPE_WAS_ENABLED=$(cat "$original/vps-enabled")
+    if [[ -f /etc/systemd/system/vps-tune-shape.service ]]; then systemctl stop vps-tune-shape.service || failed=1; fi
+    shape_restore_persistence || failed=1
+    if [[ -f $original/vps-fq ]]; then cp -a -- "$original/vps-fq" "$STATE/shaping/fq.$iface" || failed=1
+    else rm -f -- "$STATE/shaping/fq.$iface" || failed=1; fi
+    if [[ -f $original/vps-boot-mq ]]; then cp -a -- "$original/vps-boot-mq" "$STATE/shaping/boot-mq.$iface" || failed=1
+    else rm -f -- "$STATE/shaping/boot-mq.$iface" || failed=1; fi
+    tcpfit_restore_original || failed=1
+    ((failed == 0)) || return 1
+    tcpfit_set_migration_state restored
+}
+
+tcpfit_migration_finish() {
+    local rc=$1
+    trap - EXIT ERR INT TERM HUP
+    if [[ $(tcpfit_migration_state) == pending ]]; then
+        if tcpfit_migration_abort; then warn '接管未完成；tcpfit 原限速、文件和服务状态已恢复。'
+        else warn "接管恢复未完成，备份保留在 $STATE/tcpfit-migration；请检查后运行 rollback。"; rc=1; fi
+    fi
+    [[ -z ${TCPFIT_STAGING:-} ]] || rm -rf -- "$TCPFIT_STAGING"
+    exit "$rc"
+}
+
+# This action override is intentionally confined to the migration transaction.
+# shellcheck disable=SC2030
+migrate_tcpfit_shaper() (
+    local iface=$TCPFIT_MIGRATION_IFACE rate=$TCPFIT_MIGRATION_RATE
+    local backup=$STATE/tcpfit-migration TCPFIT_STAGING=''
+    local SHAPE_PERSIST_BACKUP='' SHAPE_WAS_ENABLED=0
+    local ACTION=shape SHAPE_RATE=$rate SHAPE_OFF=0
+    trap - ERR EXIT
+    trap 'tcpfit_migration_finish "$?"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    trap 'exit 129' HUP
+    tcpfit_lock
+    [[ ! -e $backup ]] || die '已有 tcpfit 迁移记录，未覆盖备份。'
+    [[ $(tcpfit_queue_signature "$iface") == "$(cat "$TCPFIT_CANDIDATE/signature")" ]] || die 'tcpfit 队列在确认后变化，未迁移。'
+    cmp -s "$TCPFIT_UNIT" "$TCPFIT_CANDIDATE/tcpfit.unit" || die 'tcpfit 服务文件在确认后变化。'
+    cmp -s "$TCPFIT_HELPER" "$TCPFIT_CANDIDATE/tcpfit.helper" || die 'tcpfit 助手在确认后变化。'
+    TCPFIT_STAGING=$(mktemp -d "$STATE/.tcpfit-migration.XXXXXXXX")
+    install -d -m 700 "$STATE/shaping" "$TCPFIT_STAGING/original"
+    cp -a -- "$TCPFIT_CANDIDATE/." "$TCPFIT_STAGING/original/"
+    shape_backup_persistence
+    cp -a -- "$SHAPE_PERSIST_BACKUP" "$TCPFIT_STAGING/original/vps-persistence"
+    rm -rf -- "$SHAPE_PERSIST_BACKUP"
+    SHAPE_PERSIST_BACKUP=
+    printf '%s\n' "$SHAPE_WAS_ENABLED" > "$TCPFIT_STAGING/original/vps-enabled"
+    [[ ! -f $STATE/shaping/fq.$iface ]] || cp -a -- "$STATE/shaping/fq.$iface" "$TCPFIT_STAGING/original/vps-fq"
+    [[ ! -f $STATE/shaping/boot-mq.$iface ]] || cp -a -- "$STATE/shaping/boot-mq.$iface" "$TCPFIT_STAGING/original/vps-boot-mq"
+    isolated_tools_fingerprint "$TCPFIT_STAGING/original" > "$TCPFIT_STAGING/original.sha256"
+    printf 'pending\n' > "$TCPFIT_STAGING/status"
+    mv -T -- "$TCPFIT_STAGING" "$backup"
+    TCPFIT_STAGING=
+    systemctl disable --now tcpfit-qdisc.service
+    # The PPP hook checks for an executable helper, independently of systemd.
+    rm -- "$TCPFIT_UNIT" "$TCPFIT_HELPER"
+    systemctl daemon-reload
+    # tcpfit may hide a native multiqueue NIC under its HTB root. Capture the
+    # actual kernel-created fq/mq boot layout while this migration can still
+    # restore the original tcpfit tree if any subsequent operation fails.
+    shape_capture_boot_mq "$iface" || die '无法记录内核原生启动队列；停止接管并恢复 tcpfit。'
+    tc qdisc replace dev "$iface" root handle 7a00: fq
+    shape_mark_fq "$iface"
+    run_shape_action
+    shape_verify_rate "$iface" "$rate" || die '原限速接管后校验失败。'
+    tcpfit_set_migration_state committed
+    log "已接管 tcpfit 的 $rate Mbit/s 整形；原配置已备份，后续扫描无建议时保留此速率。"
+)
+
+# ACTION here is the caller's action, unchanged by the migration subshell.
+# shellcheck disable=SC2031
+tcpfit_migration_guard() {
+    local status
+    status=$(tcpfit_migration_state)
+    [[ -e $STATE/tcpfit-migration ]] || return 0
+    [[ $status == pending || $status == committed || $status == restored ]] || die 'tcpfit 迁移记录状态不完整，请检查备份，未继续操作。'
+    if [[ $status == pending && $ACTION != rollback && $ACTION != check && $ACTION != menu ]]; then
+        die '存在未完成的 tcpfit 接管，请先运行 rollback 恢复，备份未覆盖。'
+    fi
+    if [[ $status == committed && $ACTION != rollback && $ACTION != check && $ACTION != menu ]]; then
+        [[ ! -e $TCPFIT_UNIT && ! -L $TCPFIT_UNIT && ! -e $TCPFIT_HELPER && ! -L $TCPFIT_HELPER ]] || die 'tcpfit 整形文件被重新创建；请先处理两个整形服务的冲突。'
+    fi
+}
+
+tcpfit_rollback_preflight() {
+    local original=$STATE/tcpfit-migration/original file saved
+    [[ -e $STATE/tcpfit-migration ]] || return 0
+    tcpfit_backup_verify
+    for file in "$TCPFIT_UNIT" "$TCPFIT_HELPER"; do
+        saved=tcpfit.helper; [[ $file != "$TCPFIT_UNIT" ]] || saved=tcpfit.unit
+        if [[ -e $file || -L $file ]]; then
+            if [[ ! -f $file || -L $file ]] || ! cmp -s "$file" "$original/$saved"; then
+                die "tcpfit 文件有后续改动，停止回滚：$file"
+            fi
+        fi
+    done
+    [[ -z $(tcpfit_service_value DropInPaths) ]] || die 'tcpfit 服务新增了自定义配置，停止回滚。'
+}
+
+tcpfit_migration_rollback() {
+    local status
+    status=$(tcpfit_migration_state)
+    [[ -n $status ]] || return 0
+    if [[ $status == committed ]]; then
+        tcpfit_restore_original || die 'tcpfit 原整形恢复未完成，备份已保留。'
+        tcpfit_set_migration_state restored
+    fi
+}
+
 smart_sweep_nominal() {
     valid_positive "$BANDWIDTH" 10000 || die 'Integrated scanning needs bandwidth >0 and <=10000 Mbit/s; choose base-only tuning for other links'
     SWEEP_NOMINAL=$(awk -v bandwidth="$BANDWIDTH" 'BEGIN {n=int(bandwidth+.5); if(n<1)n=1; print n}')
@@ -2221,6 +2721,7 @@ show_smart_sweep_plan() {
     printf '            无整形实测速率可能超过参考值；该估算不是流量硬上限。\n'
     printf '  队列影响  整张默认出口网卡使用 FQ；已有自有整形在扫描后恢复。\n'
     printf '  工具环境  缺失依赖在独立目录准备；通常用后清理，缺开机工具时保留该运行环境。\n'
+    if ((TCPFIT_MIGRATE)); then printf '  旧整形    验证并备份 tcpfit 配置，先按原速率接管；完整 rollback 可恢复。\n'; fi
     if ((APPLY_SUGGESTED_SHAPE)); then
         printf '  整形选择  仅当本次重复验证通过时自动应用建议；否则保留原整形状态。\n'
     else
@@ -2233,6 +2734,7 @@ smart_sweep_preflight() {
     local required available output root classes route peer_iface expected actual
     local -a interfaces=()
     SMART_SWEEP_REUSE_QUEUE=0
+    TCPFIT_MIGRATION_NEEDED=0
     for required in ip tc sysctl modprobe modinfo iperf3 jq timeout getent; do
         command -v "$required" >/dev/null || die "隔离扫描环境缺少 $required；工具准备未完成，未更改调优配置。"
     done
@@ -2258,6 +2760,12 @@ smart_sweep_preflight() {
         SMART_SWEEP_REUSE_QUEUE=1
     else
         output=$(tc qdisc show dev "$SMART_SWEEP_IFACE") || die 'Cannot inspect current queue'
+        if grep -Eq '^qdisc htb 1: root' <<< "$output"; then
+            ((TCPFIT_MIGRATE)) || die '检测到已有 HTB 整形；若由 tcpfit 管理，请在智能菜单同意迁移，或加 --migrate-tcpfit。未覆盖旧规则。'
+            tcpfit_migration_preflight "$SMART_SWEEP_IFACE"
+            shape_owned_files_guard
+            return 0
+        fi
         root=$(awk '$1=="qdisc" {n++;if($4=="root") kind=$2} END {if(n==1)print kind}' <<< "$output")
         [[ $root =~ ^(fq|fq_codel|cake|pfifo_fast)$ ]] || die 'Integrated tuning requires a simple single-root queue; mq/third-party shaping/extra hooks need a separate migration'
         classes=$(tc class show dev "$SMART_SWEEP_IFACE") || die 'Cannot inspect current classes'
@@ -2282,6 +2790,10 @@ smart_finish_tuning() {
     # Recheck immediately before replacing any live queue. This also catches
     # changes made while the user was reviewing the plan.
     smart_sweep_preflight
+    if ((TCPFIT_MIGRATION_NEEDED)); then
+        migrate_tcpfit_shaper
+        smart_sweep_preflight
+    fi
     if ((SMART_SWEEP_REUSE_QUEUE == 0)); then switch_queue; fi
     ensure_tmp
     local SMART_SWEEP_RESULT_FILE
@@ -2315,7 +2827,7 @@ smart_finish_tuning() {
 # queue fq explicitly creates root handle 7a00: fq before shape_mark_fq.
 
 validate_shape_args() {
-    if ((SMART_SWEEP || APPLY_SUGGESTED_SHAPE)); then
+    if ((SMART_SWEEP || APPLY_SUGGESTED_SHAPE || TCPFIT_MIGRATE)); then
         if [[ $ACTION != apply ]] || ((SMART == 0 || SMART_SWEEP == 0)); then die 'Integrated scanning requires apply --smart-bandwidth --smart-sweep'; fi
         [[ $KERNEL == skip ]] || die 'Integrated scanning requires --kernel skip; boot a newly installed kernel before measuring'
         [[ $SMART_PROFILE == bdp || $SMART_PROFILE == *-bdp ]] || die 'Integrated scanning requires a BDP profile'
@@ -2357,7 +2869,7 @@ shape_signature() {
 }
 
 shape_filter_guard() {
-    local iface=$1 parent filters
+    local iface=$1 parent filters signature
     # Only the flat fq or our two-qdisc tree is accepted. ingress/clsact and
     # additional leaves change the signature and are rejected as well.
     for parent in root 7a10: 7a10:1; do
@@ -2365,6 +2877,61 @@ shape_filter_guard() {
         else filters=$(tc filter show dev "$iface" parent "$parent") || return 1; fi
         [[ -z $filters ]] || { warn "Filters exist on $iface/$parent; refusing to replace queues"; return 1; }
     done
+    signature=$(shape_signature "$iface") || return 1
+    if grep -Eq '^qdisc mq ' <<< "$signature"; then
+        shape_mq_filter_guard "$iface" "$signature" || return 1
+    fi
+}
+
+# Only the kernel-native mq + fq layout observed during an explicit tcpfit
+# migration is remembered. These checks do not authorize arbitrary mq takeover.
+shape_mq_filter_guard() {
+    local iface=$1 signature=$2 parent filters
+    local -a parents=()
+    awk '
+        $1=="qdisc" {
+            if($2=="mq" && $3=="0:" && $4=="root" && NF==4) roots++;
+            else if($2=="fq" && $3=="0:" && $4=="parent" && $5 ~ /^(0)?:[[:xdigit:]]+$/) {
+                if(seen[$5]++) bad=1; leaves++;
+            } else bad=1;
+            next;
+        }
+        $1=="class" && $2=="mq" {next}
+        NF {bad=1}
+        END {exit !(roots==1 && leaves>0 && !bad)}' <<< "$signature" || return 1
+    filters=$(tc filter show dev "$iface") || return 1
+    [[ -z $filters ]] || { warn "Filters exist on native mq device $iface; refusing to replace queues"; return 1; }
+    mapfile -t parents < <(awk '$1=="qdisc" && $4=="parent" {print $5}' <<< "$signature")
+    for parent in "${parents[@]}"; do
+        filters=$(tc filter show dev "$iface" parent "$parent") || return 1
+        [[ -z $filters ]] || { warn "Filters exist on native mq leaf $iface/$parent; refusing to replace queues"; return 1; }
+    done
+}
+
+shape_boot_mq_matches() {
+    local iface=$1 signature=$2 marker=$STATE/shaping/boot-mq.$1 expected
+    [[ -f $marker && ! -L $marker ]] || return 1
+    expected=$(cat "$marker") || return 1
+    [[ $signature == "$expected" && $signature == 'qdisc mq 0: root'* ]] || return 1
+    [[ $(sysctl -n net.core.default_qdisc) == fq ]]
+}
+
+shape_capture_boot_mq() {
+    local iface=$1 signature temporary marker=$STATE/shaping/boot-mq.$1
+    [[ $(sysctl -n net.core.default_qdisc) == fq ]] || return 1
+    # A handle-zero default root cannot itself be deleted. Our temporary,
+    # nonzero root can, and deletion asks the kernel to build its true default.
+    tc qdisc replace dev "$iface" root handle 7a01: fq || return 1
+    tc qdisc del dev "$iface" root || return 1
+    signature=$(shape_signature "$iface") || return 1
+    if grep -Eq '^qdisc mq ' <<< "$signature"; then
+        shape_filter_guard "$iface" || return 1
+        temporary=$(mktemp "$STATE/shaping/.boot-mq.XXXXXXXX") || return 1
+        printf '%s\n' "$signature" > "$temporary" || { rm -f -- "$temporary"; return 1; }
+        mv -f -- "$temporary" "$marker" || { rm -f -- "$temporary"; return 1; }
+    else
+        rm -f -- "$marker" || return 1
+    fi
 }
 
 shape_mark_fq() {
@@ -2416,6 +2983,7 @@ shape_require_owned() {
         [[ -f $STATE/shaping/active.signature ]] || die 'Missing active queue signature'
         expected=$(cat "$STATE/shaping/active.signature")
     else expected=$fq_expected; fi
+    if shape_boot_mq_matches "$iface" "$actual"; then return 0; fi
     [[ $actual == "$expected" ]] || die 'Queue parameters/handles changed externally; refusing to replace or guess a restoration'
 }
 
@@ -2467,6 +3035,9 @@ shape_restore_original() {
     elif [[ $SHAPE_BEFORE_SIGNATURE == 'qdisc fq 0: root '* ]]; then
         [[ $(sysctl -n net.core.default_qdisc) == fq ]] || return 1
         tc qdisc del dev "$SHAPE_IFACE" root || return 1
+    elif [[ $SHAPE_BEFORE_SIGNATURE == 'qdisc mq '* ]]; then
+        shape_boot_mq_matches "$SHAPE_IFACE" "$SHAPE_BEFORE_SIGNATURE" || return 1
+        tc qdisc del dev "$SHAPE_IFACE" root || return 1
     else shape_put_fq "$SHAPE_IFACE" || return 1; fi
     [[ $(shape_signature "$SHAPE_IFACE") == "$SHAPE_BEFORE_SIGNATURE" ]]
 }
@@ -2487,13 +3058,20 @@ shape_owned_files_guard() {
 
 # Used by the generated systemd helper. A kernel-created fq root after boot has
 # handle 0:. Accept it only when ALL remaining parameters match the owned fq
-# template; mq, custom/default-changed queues, classes and filters are rejected.
+# template. A migrated native mq layout additionally needs its exact boot
+# template; unknown/custom/default-changed layouts and filters are rejected.
 shape_service_restore() {
     local rc=$1
     trap - EXIT ERR INT TERM HUP
     if ((SHAPE_SERVICE_PENDING)); then
         if [[ $SHAPE_SERVICE_BEFORE == 'qdisc fq 0: root '* ]]; then
-            tc qdisc del dev "$SHAPE_IFACE" root || rc=1
+            if [[ $(sysctl -n net.core.default_qdisc) == fq ]]; then
+                tc qdisc del dev "$SHAPE_IFACE" root || rc=1
+            else rc=1; fi
+        elif [[ $SHAPE_SERVICE_BEFORE == 'qdisc mq '* ]]; then
+            if shape_boot_mq_matches "$SHAPE_IFACE" "$SHAPE_SERVICE_BEFORE"; then
+                tc qdisc del dev "$SHAPE_IFACE" root || rc=1
+            else rc=1; fi
         elif [[ $SHAPE_SERVICE_BEFORE == 'qdisc fq 7a00: root '* ]]; then
             shape_put_fq "$SHAPE_IFACE" || rc=1
         else shape_put_rate "$SHAPE_IFACE" "$SHAPE_RATE" || rc=1; fi
@@ -2508,7 +3086,7 @@ shape_service_start() {
     actual=$(shape_signature "$SHAPE_IFACE") || die 'Cannot inspect startup queues'
     expected=$(cat "$STATE/shaping/fq.$SHAPE_IFACE") || die 'Missing fq ownership state'
     boot_expected=${expected/qdisc fq 7a00: root/qdisc fq 0: root}
-    if [[ $actual != "$expected" && $actual != "$boot_expected" ]]; then
+    if [[ $actual != "$expected" && $actual != "$boot_expected" ]] && ! shape_boot_mq_matches "$SHAPE_IFACE" "$actual"; then
         [[ -f $STATE/shaping/active.signature && $actual == "$(cat "$STATE/shaping/active.signature")" ]] || die 'Startup queue differs from owned fq/HTB; left untouched'
     fi
     # Deleting a newly installed tree can restore the kernel's handle-0 fq only
@@ -2536,7 +3114,7 @@ shape_write_service() {
         printf '#!/usr/bin/env bash\nset -Eeuo pipefail\nexport LC_ALL=C\nexport PATH=/usr/sbin:/usr/bin:/sbin:/bin\n'
         printf 'STATE=%q\nSHAPE_IFACE=%q\nSHAPE_RATE=%q\n' "$STATE" "$SHAPE_IFACE" "$SHAPE_RATE"
         printf 'warn() { printf "%%s\\n" "$*" >&2; }\ndie() { warn "$*"; exit 1; }\n'
-        for name in isolated_tools_fingerprint activate_persistent_tools shape_signature shape_filter_guard shape_put_fq shape_put_rate shape_verify_rate shape_service_restore shape_service_start; do declare -f "$name"; done
+        for name in isolated_tools_fingerprint activate_persistent_tools shape_signature shape_filter_guard shape_mq_filter_guard shape_boot_mq_matches shape_put_fq shape_put_rate shape_verify_rate shape_service_restore shape_service_start; do declare -f "$name"; done
         printf 'exec 9>/run/lock/vps-tune.lock\nflock -w 30 9 || die "vps-tune is busy"\nactivate_persistent_tools\nshape_service_start\n'
     } | write_file /usr/local/sbin/vps-tune-shape
     # Execute through bash; write_file intentionally leaves a regular 0644 file.
@@ -2763,7 +3341,7 @@ shape_rollback() (
     shape_require_owned "$SHAPE_ACTIVE_IFACE"
     SHAPE_IFACE=$SHAPE_ACTIVE_IFACE; SHAPE_BEFORE_RATE=$SHAPE_ACTIVE_RATE
     SHAPE_BEFORE_SIGNATURE=$(shape_signature "$SHAPE_IFACE")
-    [[ $SHAPE_BEFORE_SIGNATURE != 'qdisc fq '* ]] || SHAPE_BEFORE_RATE=''
+    if [[ $SHAPE_BEFORE_SIGNATURE == 'qdisc fq '* ]] || shape_boot_mq_matches "$SHAPE_IFACE" "$SHAPE_BEFORE_SIGNATURE"; then SHAPE_BEFORE_RATE=''; fi
     shape_backup_persistence
     SHAPE_RESTORE=1
     shape_put_fq "$SHAPE_ACTIVE_IFACE" || die 'Cannot remove owned shaping'
@@ -2824,7 +3402,7 @@ run_shape_action() (
     persist_scan_tools
     SHAPE_BEFORE_SIGNATURE=$(shape_signature "$SHAPE_IFACE")
     SHAPE_BEFORE_RATE=$SHAPE_ACTIVE_RATE
-    [[ $SHAPE_BEFORE_SIGNATURE != 'qdisc fq '* ]] || SHAPE_BEFORE_RATE=''
+    if [[ $SHAPE_BEFORE_SIGNATURE == 'qdisc fq '* ]] || shape_boot_mq_matches "$SHAPE_IFACE" "$SHAPE_BEFORE_SIGNATURE"; then SHAPE_BEFORE_RATE=''; fi
     if [[ $ACTION == sweep ]]; then
         SHAPE_RESTORE=1
         shape_run_sweep
@@ -2866,6 +3444,7 @@ main() {
     parse_args "$@"
     check_os
     activate_persistent_tools
+    tcpfit_migration_guard
     if ((QDISC_EXPLICIT == 0)); then QDISC=$(configured_qdisc); fi
     if [[ $ACTION == apply && -f $STATE/shaping/active && $QDISC != fq ]]; then
         die 'Active shaping needs the fq default; run shape --off before changing the base qdisc'
