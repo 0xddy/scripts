@@ -1505,9 +1505,12 @@ menu_shape() {
             if [[ $choice == 2 ]] && { ((TEST)) || is_container; }; then
                 printf '容器测试不发起真实扫描。\n'; return 0
             fi
-            menu_read '有权测试的 iperf3 对端主机/IP（端口 5201）：' || return 0
+            printf '填写另一台已运行 iperf3 -s 的服务器 IP 或域名；端口固定为 5201。\n'
+            menu_read '服务器地址（不要只填 5201，也不要带端口）：' || return 0
             peer=$REPLY
-            [[ -n $peer ]] || return 0
+            if ! valid_sweep_peer "$peer"; then
+                printf '服务器地址无效：请输入完整 IP 或域名；5201 是端口，不能作为服务器地址。\n'; return 0
+            fi
             menu_read '标称出口带宽（Mbit/s）：' || return 0
             nominal=$REPLY
             if [[ $choice == 1 ]]; then
@@ -1659,10 +1662,11 @@ menu_smart() {
         menu_read '是否加入拐点扫描 [y/N]：' n || return 0
         if [[ $REPLY == y || $REPLY == Y ]]; then
             scan=1
-            menu_read 'iperf3 对端主机/IP（服务端口 5201）：' || return 0
+            printf '填写另一台已运行 iperf3 -s 的服务器 IP 或域名；端口固定为 5201。\n'
+            menu_read '服务器地址（不要只填 5201，也不要带端口）：' || return 0
             peer=$REPLY
-            if [[ ! $peer =~ ^[a-zA-Z0-9][a-zA-Z0-9.:-]{0,252}$ ]]; then
-                printf '请输入有效主机名或 IP，不要包含端口、URL 或命令选项。\n'; return 0
+            if ! valid_sweep_peer "$peer"; then
+                printf '服务器地址无效：请输入完整 IP 或域名；5201 是端口，不能作为服务器地址。\n'; return 0
             fi
             printf '只有建议通过实测验证才会自动应用；否则不应用新的整形速率。\n'
             menu_read '自动应用验证通过的建议整形速率 [y/N]：' n || return 0
@@ -2748,8 +2752,7 @@ smart_sweep_preflight() {
     SMART_SWEEP_IFACE=${interfaces[0]}
     [[ $SMART_SWEEP_IFACE =~ ^[a-zA-Z0-9_.:-]{1,15}$ && $SMART_SWEEP_IFACE != . && $SMART_SWEEP_IFACE != .. ]] || die 'Invalid default interface'
     local address
-    address=$(getent ahosts "$SWEEP_PEER" | awk 'NR==1 {print $1}') || die 'Cannot resolve the supplied peer'
-    [[ -n $address ]] || die 'Cannot resolve the supplied peer'
+    address=$(resolve_sweep_peer "$SWEEP_PEER") || die '无法解析有效的 iperf3 服务器地址；请填写服务器 IP 或域名，不是端口 5201。'
     route=$(ip route get "$address") || die 'Cannot route to supplied peer'
     peer_iface=$(awk '{for(i=1;i<NF;i++) if($i=="dev") {print $(i+1);exit}}' <<< "$route")
     [[ $peer_iface == "$SMART_SWEEP_IFACE" ]] || die 'Peer route differs from the default interface; no settings changed'
@@ -2826,6 +2829,75 @@ smart_finish_tuning() {
 # SHAPE_RATE= SHAPE_OFF=0 SWEEP_PEER= SWEEP_NOMINAL= ACCEPT_TRAFFIC=0
 # queue fq explicitly creates root handle 7a00: fq before shape_mark_fq.
 
+valid_sweep_ipv4() {
+    local address=$1 octet
+    local -a octets=()
+    [[ $address =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+    IFS=. read -r -a octets <<< "$address"
+    for octet in "${octets[@]}"; do
+        [[ $octet == 0 || $octet =~ ^[1-9][0-9]{0,2}$ ]] || return 1
+        ((10#$octet <= 255)) || return 1
+    done
+}
+
+valid_sweep_ipv6() {
+    local address=$1 tail head part compressed=0
+    local -a groups=()
+    [[ $address == *:* && $address != *[^0-9a-fA-F:.]* ]] || return 1
+    # An embedded dotted IPv4 tail occupies two IPv6 groups.
+    if [[ $address == *.* ]]; then
+        tail=${address##*:}
+        valid_sweep_ipv4 "$tail" || return 1
+        address=${address%:*}:0:0
+    fi
+    [[ $address != *:::* ]] || return 1
+    [[ $address != :* || $address == ::* ]] || return 1
+    [[ $address != *: || $address == *:: ]] || return 1
+    if [[ $address == *::* ]]; then
+        compressed=1
+        head=${address%%::*}; tail=${address#*::}
+        [[ $tail != *::* ]] || return 1
+        address=$head
+        [[ -z $head || -z $tail ]] || address+=:
+        address+=$tail
+    else
+        [[ $address != :* && $address != *: ]] || return 1
+    fi
+    IFS=: read -r -a groups <<< "$address"
+    for part in "${groups[@]}"; do [[ $part =~ ^[0-9a-fA-F]{1,4}$ ]] || return 1; done
+    if ((compressed)); then ((${#groups[@]} < 8))
+    else ((${#groups[@]} == 8)); fi
+}
+
+valid_sweep_peer() {
+    local peer=${1:-} host label numeric=1
+    local -a labels=()
+    [[ -n $peer && ${#peer} -le 254 ]] || return 1
+    if [[ $peer == *:* ]]; then valid_sweep_ipv6 "$peer"; return; fi
+    if [[ $peer =~ ^[0-9.]+$ ]]; then valid_sweep_ipv4 "$peer"; return; fi
+    host=${peer%.}
+    [[ -n $host && ${#host} -le 253 && $host != .* && $host != *. && $host != *..* ]] || return 1
+    IFS=. read -r -a labels <<< "$host"
+    for label in "${labels[@]}"; do
+        [[ ${#label} -le 63 && $label =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$ ]] || return 1
+        [[ $label =~ ^([0-9]+|0[xX][0-9a-fA-F]+)$ ]] || numeric=0
+    done
+    # libc accepts inet_aton aliases such as 5201, 127.1 and 0x7f.1. These
+    # commonly represent a mistaken port/partial address, not the chosen host.
+    ((numeric == 0))
+}
+
+resolve_sweep_peer() {
+    local peer=$1 address
+    valid_sweep_peer "$peer" || return 1
+    if valid_sweep_ipv4 "$peer" || valid_sweep_ipv6 "$peer"; then
+        printf '%s\n' "$peer"; return 0
+    fi
+    address=$(getent ahosts "$peer" | awk 'NR==1 {print $1}') || return 1
+    if ! valid_sweep_ipv4 "$address" && ! valid_sweep_ipv6 "$address"; then return 1; fi
+    printf '%s\n' "$address"
+}
+
 validate_shape_args() {
     if ((SMART_SWEEP || APPLY_SUGGESTED_SHAPE || TCPFIT_MIGRATE)); then
         if [[ $ACTION != apply ]] || ((SMART == 0 || SMART_SWEEP == 0)); then die 'Integrated scanning requires apply --smart-bandwidth --smart-sweep'; fi
@@ -2833,7 +2905,7 @@ validate_shape_args() {
         [[ $SMART_PROFILE == bdp || $SMART_PROFILE == *-bdp ]] || die 'Integrated scanning requires a BDP profile'
         ((TEST == 0)) || die 'Integrated scanning is disabled in container-test'
         if [[ -n $SHAPE_RATE || -n $SWEEP_NOMINAL ]] || ((SHAPE_OFF)); then die 'Integrated scanning reuses bandwidth and a validated rate; do not specify shape/nominal options'; fi
-        [[ $SWEEP_PEER =~ ^[a-zA-Z0-9][a-zA-Z0-9.:-]{0,252}$ ]] || die '--smart-sweep requires --peer HOST (iperf3 port 5201)'
+        valid_sweep_peer "$SWEEP_PEER" || die '--peer 需要完整的服务器 IP 或域名；不要只填端口 5201，也不要包含 URL、端口或 IPv6 方括号/zone。'
         ((ACCEPT_TRAFFIC || DRY)) || die '--smart-sweep sends real traffic; pass --accept-traffic'
         if ((QDISC_EXPLICIT)) && [[ $QDISC != fq ]]; then die 'Integrated scanning requires --qdisc fq'; fi
         QDISC=fq; QDISC_EXPLICIT=1
@@ -2853,7 +2925,7 @@ validate_shape_args() {
         fi
     else
         if [[ -n $SHAPE_RATE ]] || ((SHAPE_OFF != 0)); then die 'sweep does not accept shape options'; fi
-        [[ $SWEEP_PEER =~ ^[a-zA-Z0-9][a-zA-Z0-9.:-]{0,252}$ ]] || die '--peer requires your own/authorized iperf3 host or IP (port 5201)'
+        valid_sweep_peer "$SWEEP_PEER" || die '--peer 需要完整的服务器 IP 或域名；不要只填端口 5201，也不要包含 URL、端口或 IPv6 方括号/zone。'
         if [[ ! $SWEEP_NOMINAL =~ ^[1-9][0-9]{0,4}$ ]] || ((SWEEP_NOMINAL > 10000)); then die '--nominal-mbps must be an integer, 1..10000'; fi
         ((ACCEPT_TRAFFIC || DRY)) || die 'sweep sends real traffic; explicitly pass --accept-traffic'
     fi
@@ -3215,6 +3287,25 @@ shape_transaction_finish() {
     exit "$rc"
 }
 
+# Read an iperf3 diagnostic as data. Preserve the original JSON/stderr on disk,
+# but display at most one short line without terminal or Unicode controls.
+shape_report_iperf_error() {
+    local file=$1 detail
+    [[ -f $file && -r $file ]] || return 0
+    detail=$(jq -ers '
+        if length == 1 and (.[0] | type) == "object" then .[0].error else empty end |
+        select(type == "string") |
+        explode | map(if . < 32 or (. >= 127 and . <= 159) or . == 1564 or
+            (. >= 8203 and . <= 8207) or (. >= 8232 and . <= 8238) or
+            (. >= 8288 and . <= 8303) or . == 65279 then 32 else . end) | implode |
+        gsub(" +"; " ") | sub("^ +"; "") | sub(" +$"; "") |
+        if length > 240 then .[0:240] + "..." else . end |
+        select(length > 0)
+    ' "$file" 2>/dev/null) || return 0
+    warn "iperf3 error: $detail"
+    return 0
+}
+
 # One TCP stream, sender-side retransmissions divided by estimated segment
 # count from sent bytes / reported MSS. This is NOT packet-loss probability.
 shape_sample() {
@@ -3227,12 +3318,18 @@ shape_sample() {
     SHAPE_IPERF_PID=$!
     if wait "$SHAPE_IPERF_PID"; then rc=0; else rc=$?; fi
     SHAPE_IPERF_PID=''
-    ((rc == 0)) || die "iperf3 failed or timed out (exit $rc); retained diagnostics in $file"
-    values=$(jq -er '
+    if ((rc != 0)); then
+        shape_report_iperf_error "$file"
+        die "iperf3 failed or timed out (exit $rc); retained diagnostics in $file (stderr: $file.stderr)"
+    fi
+    if ! values=$(jq -er '
         if .error then error(.error) else . end |
         [.end.sum_sent.bytes, .end.sum_sent.retransmits, .end.sum_received.bits_per_second, .start.tcp_mss_default] |
         if (all(.[]; type == "number")) and .[0]>0 and .[1]>=0 and .[2]>0 and .[3]>=256 and .[3]<=65535
-        then @tsv else error("Missing or invalid TCP bytes/retransmits/receiver goodput/MSS") end' "$file") || die "Unsupported/incomplete iperf3 JSON: $file"
+        then @tsv else error("Missing or invalid TCP bytes/retransmits/receiver goodput/MSS") end' "$file" 2> "$file.parse.stderr"); then
+        shape_report_iperf_error "$file"
+        die "Unsupported/incomplete iperf3 JSON: $file (parser details: $file.parse.stderr)"
+    fi
     local bytes retrans recv mss
     IFS=$'\t' read -r bytes retrans recv mss <<< "$values"
     read -r SHAPE_SAMPLE_GOODPUT SHAPE_SAMPLE_RATIO < <(awk -v b="$bytes" -v r="$retrans" -v g="$recv" -v m="$mss" 'BEGIN {printf "%.4f %.6f\n",g/1000000,100*r*m/b}')
@@ -3391,8 +3488,7 @@ run_shape_action() (
     if [[ $ACTION == sweep ]]; then
         for required in iperf3 jq timeout getent; do command -v "$required" >/dev/null || die "Isolated sweep environment is missing $required"; done
         # Resolve only the explicitly supplied peer; never select public peers.
-        address=$(getent ahosts "$SWEEP_PEER" | awk 'NR==1 {print $1}') || die 'Cannot resolve the supplied peer'
-        [[ -n $address ]] || die 'Cannot resolve the supplied peer'
+        address=$(resolve_sweep_peer "$SWEEP_PEER") || die '无法解析有效的 iperf3 服务器地址；请填写服务器 IP 或域名，不是端口 5201。'
         ipline=$(ip route get "$address") || die 'Cannot route to supplied peer'
         iface=$(awk '{for(i=1;i<NF;i++)if($i=="dev"){print $(i+1);exit}}' <<< "$ipline")
         [[ $iface == "$SHAPE_IFACE" ]] || die 'Peer route differs from the managed interface; no traffic sent'
